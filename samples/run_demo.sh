@@ -53,8 +53,8 @@ llvm-dis "$OUT/hello_obf.bc" -o "$OUT/hello_obf.ll"
 # Object + binary
 llc -filetype=obj "$OUT/hello_clean.bc" -o "$OUT/hello_clean.o"
 llc -filetype=obj "$OUT/hello_obf.bc" -o "$OUT/hello_obf.o"
-clang "$OUT/hello_clean.o" -o "$OUT/hello_clean"
-clang "$OUT/hello_obf.o" -o "$OUT/hello_obf"
+clang -no-pie "$OUT/hello_clean.o" -o "$OUT/hello_clean"
+clang -no-pie "$OUT/hello_obf.o" -o "$OUT/hello_obf"
 
 echo "-- clean run --"
 "$OUT/hello_clean" 2 "hikari-secret-2026" || true

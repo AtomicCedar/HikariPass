@@ -43,8 +43,8 @@ llvm-dis "$OUT/vmp_add_obf.bc" -o "$OUT/vmp_add_obf.ll"
 
 llc -filetype=obj "$OUT/vmp_add_clean.bc" -o "$OUT/vmp_add_clean.o"
 llc -filetype=obj "$OUT/vmp_add_obf.bc" -o "$OUT/vmp_add_obf.o"
-clang "$OUT/vmp_add_clean.o" -o "$OUT/vmp_add_clean"
-clang "$OUT/vmp_add_obf.o" -o "$OUT/vmp_add_obf"
+clang -no-pie "$OUT/vmp_add_clean.o" -o "$OUT/vmp_add_clean"
+clang -no-pie "$OUT/vmp_add_obf.o" -o "$OUT/vmp_add_obf"
 
 echo "-- clean --"
 CLEAN_OUT="$("$OUT/vmp_add_clean")"
