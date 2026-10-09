@@ -216,10 +216,14 @@ struct VMPContext {
     if (CurBB)
       CurBB->OpcodeOffsets.push_back(static_cast<uint32_t>(Code.size()));
     emitU8(Code, op(K));
-    // Fake-instruction injection: with a deterministic per-function chance,
-    // emit OP_NOP after a real opcode.  The interpreter skips it for free and
-    // decoders can no longer assume opcode positions line up with instructions.
-    if (FakeInst && K != 0 && (fnNext(&FakeState) & 3) == 0) {
+  }
+
+  // Fake-instruction injection at INSTRUCTION boundaries (never between an
+  // opcode and its operands — handlers read operands immediately after the
+  // opcode byte).  Deterministic per-function stream; the interpreter skips
+  // OP_NOP for free and decoders can't assume instruction positions.
+  void maybeInjectFake() {
+    if (FakeInst && (fnNext(&FakeState) & 3) == 0) {
       if (CurBB)
         CurBB->OpcodeOffsets.push_back(static_cast<uint32_t>(Code.size()));
       emitU8(Code, op(0));
@@ -605,6 +609,12 @@ static bool translateInst(VMPContext &C, Instruction *I) {
       return C.fail("invoke"), false;
     if (CB->isMustTailCall())
       return C.fail("musttail"), false;
+    // Varargs call sites (JNI style `env->CallStaticObjectMethod(...)`,
+    // printf, ...) have no fixed callee signature to re-emit from the
+    // interpreter's call handler; translating them produced verifier-failing
+    // IR.  Skip the whole function cleanly instead.
+    if (CB->getFunctionType()->isVarArg())
+      return C.fail("varargs call site"), false;
 
     // Only direct calls to known functions, or indirect with mapped callee value.
     CallSiteInfo CS;
@@ -706,6 +716,8 @@ static bool translateFunction(VMPContext &C) {
     for (Instruction &I : BB) {
       if (C.Failed || !translateInst(C, &I))
         return false;
+      if (!C.Failed)
+        C.maybeInjectFake();
     }
     C.CurBB->EndIP = static_cast<uint32_t>(C.Code.size());
     C.CurBB = nullptr;
@@ -1275,6 +1287,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   EB.CreateBr(Loop);
 
   IRBuilder<> LB(Loop);
+  // Loop: keep running while Run!=0.
   LB.CreateCondBr(
       LB.CreateICmpNE(LB.CreateLoad(I8, Run), ConstantInt::get(I8, 0)), Disp,
       Halt);
@@ -1282,24 +1295,27 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   IRBuilder<> DB(Disp);
   AllocaInst *CSForFetch = Encrypt ? CodeState : nullptr;
   AllocaInst *OSForFetch = Encrypt ? OpState : nullptr;
-  Value *Op = irFetchOp(DB, I8, I32, Code, IP, CSForFetch, OSForFetch);
+  // IP bound check: any way the bytecode or a bug drives ip past the code
+  // image must land in Halt instead of reading out of bounds (Android SEGV).
+  auto *IPBad = BasicBlock::Create(Ctx, "", Host);
+  auto *Fetch = BasicBlock::Create(Ctx, "", Host);
+  DB.CreateCondBr(
+      DB.CreateICmpULT(
+          DB.CreateLoad(I32, IP),
+          ConstantInt::get(I32, static_cast<uint32_t>(V.Code.size()))),
+      Fetch, IPBad);
+  IRBuilder<> PB(IPBad);
+  PB.CreateStore(ConstantInt::get(I8, 0), Run);
+  PB.CreateBr(Halt);
+  IRBuilder<> FB(Fetch);
+  Value *Op = irFetchOp(FB, I8, I32, Code, IP, CSForFetch, OSForFetch);
   auto ci8 = [&](uint64_t V) {
     return cast<ConstantInt>(ConstantInt::get(I8, V));
   };
-  // IP bound check: any way the bytecode or a bug drives ip past the code
-  // image must land in Trap instead of reading out of bounds (SIGSEGV on
-  // Android).  CodeSize is a compile-time constant of this function's image.
-  auto *IPChk = BasicBlock::Create(Ctx, "", Host);
-  IRBuilder<> XB(IPChk);
-  Value *IPLim = XB.CreateLoad(I32, IP);
-  XB.CreateStore(
-      XB.CreateZExt(XB.CreateICmpULT(IPLim, ConstantInt::get(I32, static_cast<uint32_t>(V.Code.size()))), I8),
-      Run);
-  XB.CreateBr(Loop);
-  LB.CreateCondBr(
-      LB.CreateICmpNE(LB.CreateLoad(I8, Run), ConstantInt::get(I8, 0)), IPChk,
-      Halt);
-  SwitchInst *SW = XB.CreateSwitch(Op, Trap, 16);
+  SwitchInst *SW = FB.CreateSwitch(Op, Trap, 16);
+  // OP_NOP (fake instruction): fetch it, skip it, keep running.  Without an
+  // explicit case it would fall to Trap and silently halt the VM.
+  SW->addCase(ci8(V.op(OP_NOP)), Fetch);
   SW->addCase(ci8(V.op(OP_ALLOCA)), HAlloca);
   SW->addCase(ci8(V.op(OP_LOAD)), HLoad);
   SW->addCase(ci8(V.op(OP_STORE)), HStore);

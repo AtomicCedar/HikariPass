@@ -62,5 +62,26 @@ TV="$("$OUT/thr_obf_bin"; echo "rc=$?")"
 if [[ "$TC" == "$TV" && "$TC" == *"rc=0"* ]]; then r=0; else r=1; fi
 check "T5-multithread-parity" $r
 
+# T6: varargs call sites (JNI style) must not emit verifier-failing IR: the
+# function is skipped cleanly and the module still verifies.
+clang -O0 -emit-llvm -S "$ROOT/samples/c/vmp_varargs.c" -o "$OUT/va.ll"
+if opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/va.ll" -o "$OUT/va.bc" 2>"$OUT/va.err"; then r=0; else r=1; fi
+if grep -q "verify failed\|does not have terminator\|Terminator found" "$OUT/va.err"; then r=1; fi
+if grep -q "varargs call site" "$OUT/va.err"; then r=0; else r=1; fi
+check "T6-varargs-call-site-clean-skip" $r
+
+# T7: a function with NO varargs calls but a global store (JNI_OnLoad shape)
+# must virtualize successfully (no verify failure).
+cat > "$OUT/jnionload.c" <<'CEOF'
+typedef struct JavaVM { int x; } JavaVM;
+static JavaVM *g_vm;
+int JNI_OnLoad(JavaVM *v, void *r) { (void)r; g_vm = v; return 65542; }
+CEOF
+clang -O0 -emit-llvm -S "$OUT/jnionload.c" -o "$OUT/jo.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/jo.ll" -o "$OUT/jo.bc" 2>"$OUT/jo.err"
+if grep -q "verify failed" "$OUT/jo.err"; then r=1; else r=0; fi
+if grep -q "@vmp_code_JNI_OnLoad" <(llvm-dis "$OUT/jo.bc" -o -); then r=0; else r=1; fi
+check "T7-simple-jni-onload-virtualized" $r
+
 rm -rf "$OUT"
 exit $FAIL
