@@ -83,5 +83,9 @@ if grep -q "verify failed" "$OUT/jo.err"; then r=1; else r=0; fi
 if grep -q "@vmp_code_JNI_OnLoad" <(llvm-dis "$OUT/jo.bc" -o -); then r=0; else r=1; fi
 check "T7-simple-jni-onload-virtualized" $r
 
+# T8: interpreter handler BBs must not sit in bytecode/switch order
+python3 "$ROOT/samples/check_handler_shuffle.py" >/dev/null 2>&1
+check "T8-handler-shuffle" $?
+
 rm -rf "$OUT"
 exit $FAIL

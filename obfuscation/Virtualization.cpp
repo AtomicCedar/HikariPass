@@ -422,24 +422,30 @@ static bool translateInst(VMPContext &C, Instruction *I) {
   }
 
   if (auto *LI = dyn_cast<LoadInst>(I)) {
-    if (LI->isAtomic() || LI->isVolatile() || !isTypeOK(LI->getType()))
+    if (LI->isVolatile() || !isTypeOK(LI->getType()))
       return C.fail("bad load"), false;
+    // Atomic loads are virtualized as ordinary loads; the ordering guarantee
+    // is preserved by emitting an OP_FENCE right after the instruction.
     uint32_t Sz = C.typeSize(LI->getType());
     uint32_t Res = C.allocSlot(Sz, C.typeAlign(LI->getType()));
     C.map(LI, Res);
     C.emitOp(OP_LOAD);
     emitPackedVar(C.Code, static_cast<uint8_t>(Sz), Res);
     emitOperand(C, LI->getPointerOperand());
+    if (LI->isAtomic())
+      C.emitOp(OP_FENCE);
     return true;
   }
 
   if (auto *SI = dyn_cast<StoreInst>(I)) {
-    if (SI->isAtomic() || SI->isVolatile() ||
-        !isTypeOK(SI->getValueOperand()->getType()))
+    if (SI->isVolatile() || !isTypeOK(SI->getValueOperand()->getType()))
       return C.fail("bad store"), false;
     C.emitOp(OP_STORE);
     emitOperand(C, SI->getValueOperand());
     emitOperand(C, SI->getPointerOperand());
+    // Release ordering for atomic stores via a trailing fence.
+    if (SI->isAtomic())
+      C.emitOp(OP_FENCE);
     return true;
   }
 
@@ -1024,6 +1030,26 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   auto *HSel = BasicBlock::Create(Ctx, "", Host);
   auto *HUnr = BasicBlock::Create(Ctx, "", Host);
 
+  // Handler shuffling: physically reorder the handler BBs in the function
+  // body so their textual order stops mirroring the opcode switch order.
+  // Deterministic per function (xorshift32 on the fn seed).
+  {
+    BasicBlock *Handlers[] = {HAlloca, HLoad,  HStore, HBin, HIcmp,
+                              HBr,     HRet,   HGep,   HCall, HCast,
+                              HSel,    HUnr};
+    constexpr unsigned N = sizeof(Handlers) / sizeof(Handlers[0]);
+    uint32_t SS = fnHashSeed((Twine("shuffle|") + Host->getName()).str());
+    if (!SS) SS = 0x9E3779B9;
+    for (unsigned I = N - 1; I > 0; --I) {
+      uint32_t J = fnNext(&SS) % (I + 1);
+      BasicBlock *Tmp = Handlers[I];
+      Handlers[I] = Handlers[J];
+      Handlers[J] = Tmp;
+    }
+    for (BasicBlock *HB : Handlers)
+      HB->moveBefore(Host->end());
+  }
+
   // call_handler(data*, func_id)
   FunctionType *CHTy = FunctionType::get(Type::getVoidTy(Ctx),
                                          {I8Ptr, I64}, false);
@@ -1312,10 +1338,19 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   auto ci8 = [&](uint64_t V) {
     return cast<ConstantInt>(ConstantInt::get(I8, V));
   };
+  // FENCE: ordering for virtualized atomic ops (acq_rel is a safe
+  // conservative upgrade of the acquire/release the producer used).
+  auto *HFence = BasicBlock::Create(Ctx, "", Host);
+  {
+    IRBuilder<> B(HFence);
+    B.CreateFence(AtomicOrdering::AcquireRelease, SyncScope::System);
+    B.CreateBr(Loop);
+  }
   SwitchInst *SW = FB.CreateSwitch(Op, Trap, 16);
   // OP_NOP (fake instruction): fetch it, skip it, keep running.  Without an
   // explicit case it would fall to Trap and silently halt the VM.
   SW->addCase(ci8(V.op(OP_NOP)), Fetch);
+  SW->addCase(ci8(V.op(OP_FENCE)), HFence);
   SW->addCase(ci8(V.op(OP_ALLOCA)), HAlloca);
   SW->addCase(ci8(V.op(OP_LOAD)), HLoad);
   SW->addCase(ci8(V.op(OP_STORE)), HStore);

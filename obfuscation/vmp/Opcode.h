@@ -19,6 +19,7 @@ enum Op : uint8_t {
   OP_CALL = 0x09,
   OP_CAST = 0x0A,
   OP_SELECT = 0x0B,
+  OP_FENCE = 0x0C,
   OP_UNREACHABLE = 0x0E,
 };
 
