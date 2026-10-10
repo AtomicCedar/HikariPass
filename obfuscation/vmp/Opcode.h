@@ -20,7 +20,10 @@ enum Op : uint8_t {
   OP_CAST = 0x0A,
   OP_SELECT = 0x0B,
   OP_FENCE = 0x0C,
+  OP_ATOMICRMW = 0x0D,
   OP_UNREACHABLE = 0x0E,
+  OP_CMPXCHG = 0x0F,
+  OP_COPY = 0x10,
 };
 
 enum BinSubOp : uint8_t {
@@ -59,6 +62,23 @@ enum CastKind : uint8_t {
   CAST_BITCAST = 3,
   CAST_PTRTOINT = 4,
   CAST_INTTOPTR = 5,
+};
+
+// AtomicRMW sub-op — mirrors LLVM's AtomicRMWInst::BinOp for the integer
+// operations the VM supports (values shared with BIN_* where possible is
+// NOT assumed; this enum is its own wire format).
+enum RmwSubOp : uint8_t {
+  RMW_XCHG = 0,
+  RMW_ADD = 1,
+  RMW_SUB = 2,
+  RMW_AND = 3,
+  RMW_OR = 4,
+  RMW_XOR = 5,
+  RMW_NAND = 6,
+  RMW_MAX = 7,
+  RMW_MIN = 8,
+  RMW_UMAX = 9,
+  RMW_UMIN = 10,
 };
 
 static constexpr unsigned kPointerSize = 8;

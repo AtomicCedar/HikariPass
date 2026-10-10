@@ -101,5 +101,38 @@ llvm-dis "$OUT/gvar.bc" -o "$OUT/gvar_o.ll"
 if grep -q "through global ptr secret" "$OUT/gvar_o.ll"; then r=1; else r=0; fi
 check "T9-global-ptr-string-encrypted" $r
 
+# T10: atomics (RMW + CAS) virtualized and stack-safe in a long loop.
+# Guards two regressions: (a) atomicrmw/cmpxchg rejected outright,
+# (b) handler-local allocas lowering to per-visit dynamic stack adjustments
+# that leak ~1KB/iteration and hit the guard page after ~8k iterations.
+cat > "$OUT/atomic_loop.c" <<'AEOF'
+#include <stdatomic.h>
+#include <stddef.h>
+static _Atomic int hits = 0;
+static _Atomic int rmw = 0;
+__attribute__((annotate("vmp")))
+static void loop(int n) {
+  for (int i = 0; i < n; ++i) {
+    int exp = i;
+    atomic_compare_exchange_strong(&hits, &exp, i + 1);
+    atomic_fetch_add(&rmw, 1);
+  }
+}
+int main(void) {
+  loop(20000);
+  return (atomic_load(&hits) == 20000 && rmw == 20000) ? 0 : 1;
+}
+AEOF
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/atomic_loop.c" -o "$OUT/atomic_loop.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/atomic_loop.ll" \
+  -o "$OUT/atomic_loop.bc" 2>"$OUT/atomic_loop.err"
+r=1
+if grep -q "build fail\|translate fail" "$OUT/atomic_loop.err"; then r=1; else
+  llc -filetype=obj "$OUT/atomic_loop.bc" -o "$OUT/atomic_loop.o" 2>/dev/null && \
+  clang -no-pie "$OUT/atomic_loop.o" -o "$OUT/atomic_loop_run" 2>/dev/null && \
+  "$OUT/atomic_loop_run" >/dev/null 2>&1 && r=0
+fi
+check "T10-atomic-longloop-stress" $r
+
 rm -rf "$OUT"
 exit $FAIL

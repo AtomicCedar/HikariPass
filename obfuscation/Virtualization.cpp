@@ -77,6 +77,11 @@ static uint32_t nonzeroSeed() {
 
 static void emitU8(std::vector<uint8_t> &C, uint8_t V) { C.push_back(V); }
 
+static void emitU32(std::vector<uint8_t> &C, uint32_t V) {
+  for (unsigned I = 0; I < 4; ++I)
+    C.push_back(static_cast<uint8_t>((V >> (8 * I)) & 0xFF));
+}
+
 static void emitU64(std::vector<uint8_t> &C, uint64_t V) {
   for (unsigned I = 0; I < 8; ++I)
     C.push_back(static_cast<uint8_t>((V >> (8 * I)) & 0xFF));
@@ -182,9 +187,12 @@ struct VMPContext {
   // Per-function opcode mapping: wire[k] = the byte value that stands for
   // Opcode k in this function's bytecode.  Derived from the function name and
   // HIKARI_SEED so every function (and every build) gets a unique encoding.
-  uint8_t WireOp[16] = {0};
+  uint8_t WireOp[17] = {0};
   bool FakeInst = true;
   uint32_t FakeState = 0;
+  // cmpxchg results are {old, i1} structs: remember both slots so
+  // ExtractValue(0/1) can be translated as a plain read.
+  std::map<std::pair<Value *, unsigned>, uint32_t> PairSlot;
 
   void initOpcodeMap(StringRef FName) {
     uint32_t S = fnHashSeed(FName);
@@ -194,7 +202,7 @@ struct VMPContext {
     bool Used[256] = {false};
     Used[0] = true;
     WireOp[0] = 0;
-    for (unsigned K = 1; K < 16; ++K) {
+    for (unsigned K = 1; K < 17; ++K) {
       uint8_t V;
       do {
         V = static_cast<uint8_t>(fnNext(&S) & 0xFF);
@@ -675,6 +683,69 @@ static bool translateInst(VMPContext &C, Instruction *I) {
     return true;
   }
 
+  if (auto *RMW = dyn_cast<AtomicRMWInst>(I)) {
+    if (!isTypeOK(RMW->getType()) || !RMW->getValOperand()->getType()->isIntegerTy())
+      return C.fail("bad atomicrmw type"), false;
+    unsigned BinOp;
+    switch (RMW->getOperation()) {
+    case AtomicRMWInst::Xchg: BinOp = RMW_XCHG; break;
+    case AtomicRMWInst::Add:  BinOp = RMW_ADD;  break;
+    case AtomicRMWInst::Sub:  BinOp = RMW_SUB;  break;
+    case AtomicRMWInst::And:  BinOp = RMW_AND;  break;
+    case AtomicRMWInst::Or:   BinOp = RMW_OR;   break;
+    case AtomicRMWInst::Xor:  BinOp = RMW_XOR;  break;
+    case AtomicRMWInst::Nand: BinOp = RMW_NAND; break;
+    case AtomicRMWInst::Max:  BinOp = RMW_MAX;  break;
+    case AtomicRMWInst::Min:  BinOp = RMW_MIN;  break;
+    case AtomicRMWInst::UMax: BinOp = RMW_UMAX; break;
+    case AtomicRMWInst::UMin: BinOp = RMW_UMIN; break;
+    default:
+      return C.fail("atomicrmw op"), false;
+    }
+    uint32_t Sz = C.typeSize(RMW->getType());
+    uint32_t Res = C.allocSlot(Sz, C.typeAlign(RMW->getType()));
+    C.map(RMW, Res);
+    C.emitOp(OP_ATOMICRMW);
+    emitU8(C.Code, static_cast<uint8_t>(BinOp));
+    emitPackedVar(C.Code, static_cast<uint8_t>(Sz), Res);
+    emitOperand(C, RMW->getPointerOperand());
+    emitOperand(C, RMW->getValOperand());
+    return true;
+  }
+
+  if (auto *CX = dyn_cast<AtomicCmpXchgInst>(I)) {
+    if (!CX->getCompareOperand()->getType()->isIntegerTy())
+      return C.fail("bad cmpxchg type"), false;
+    uint32_t Sz = C.typeSize(CX->getNewValOperand()->getType());
+    uint32_t Res = C.allocSlot(Sz, C.typeAlign(CX->getNewValOperand()->getType()));
+    uint32_t Flag = C.allocSlot(1, Align(1));
+    C.PairSlot[{CX, 0}] = Res;
+    C.PairSlot[{CX, 1}] = Flag;
+    C.emitOp(OP_CMPXCHG);
+    emitU8(C.Code, static_cast<uint8_t>(Sz));
+    emitOperand(C, CX->getPointerOperand());
+    emitOperand(C, CX->getCompareOperand());
+    emitOperand(C, CX->getNewValOperand());
+    emitU32(C.Code, Res);
+    emitU32(C.Code, Flag);
+    return true;
+  }
+
+  if (auto *EV = dyn_cast<ExtractValueInst>(I)) {
+    // Only the cmpxchg {old, i1} shape is supported.
+    Value *Agg = EV->getAggregateOperand();
+    auto It = C.PairSlot.find({Agg, EV->getIndices()[0]});
+    if (It == C.PairSlot.end())
+      return C.fail("bad extractvalue"), false;
+    uint32_t Sz = C.typeSize(EV->getType());
+    uint32_t Res = C.allocSlot(Sz, C.typeAlign(EV->getType()));
+    C.map(EV, Res);
+    C.emitOp(OP_COPY);
+    emitPackedVar(C.Code, static_cast<uint8_t>(Sz), Res);
+    emitU32(C.Code, It->second);
+    return true;
+  }
+
   if (isa<PHINode>(I))
     return C.fail("phi remains"), false;
 
@@ -1017,6 +1088,22 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   auto *Halt = BasicBlock::Create(Ctx, "", Host);
   auto *Trap = BasicBlock::Create(Ctx, "", Host);
 
+  // Handler scratch allocas MUST live in the entry block.  llc lowers an
+  // alloca in a non-entry block to a DYNAMIC stack adjustment that is never
+  // popped, so every pass through a handler would permanently eat stack —
+  // a long-running virtualized loop (e.g. 10k atomic RMW iterations) then
+  // walks 8MB down and dies on the guard page.  Entry-block allocas are
+  // hoisted into the frame once; reuse across handler invocations is safe
+  // because each handler writes its scratch before reading it and the VM
+  // never re-enters a handler mid-use (per-invocation VM state).
+  IRBuilder<> AB0(Entry);
+  auto *SzT8 = AB0.CreateAlloca(I8, nullptr, "hscratch8");
+  auto *SzT32 = AB0.CreateAlloca(I32, nullptr, "hscratch32");
+  auto *SzT64 = AB0.CreateAlloca(I64, nullptr, "hscratch64");
+  auto entryAlloca8 = [&]() { return SzT8; };
+  auto entryAlloca32 = [&]() { return SzT32; };
+  auto entryAlloca64 = [&]() { return SzT64; };
+
   auto *HAlloca = BasicBlock::Create(Ctx, "", Host);
   auto *HLoad = BasicBlock::Create(Ctx, "", Host);
   auto *HStore = BasicBlock::Create(Ctx, "", Host);
@@ -1029,6 +1116,10 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   auto *HCast = BasicBlock::Create(Ctx, "", Host);
   auto *HSel = BasicBlock::Create(Ctx, "", Host);
   auto *HUnr = BasicBlock::Create(Ctx, "", Host);
+  auto *HRmw = BasicBlock::Create(Ctx, "", Host);
+  auto *HCxg = BasicBlock::Create(Ctx, "", Host);
+  auto *HCopy = BasicBlock::Create(Ctx, "", Host);
+  (void)0;
 
   // Handler shuffling: physically reorder the handler BBs in the function
   // body so their textual order stops mirroring the opcode switch order.
@@ -1036,7 +1127,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     BasicBlock *Handlers[] = {HAlloca, HLoad,  HStore, HBin, HIcmp,
                               HBr,     HRet,   HGep,   HCall, HCast,
-                              HSel,    HUnr};
+                              HSel,    HUnr,   HRmw,   HCxg,  HCopy};
     constexpr unsigned N = sizeof(Handlers) / sizeof(Handlers[0]);
     uint32_t SS = fnHashSeed((Twine("shuffle|") + Host->getName()).str());
     if (!SS) SS = 0x9E3779B9;
@@ -1346,7 +1437,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     B.CreateFence(AtomicOrdering::AcquireRelease, SyncScope::System);
     B.CreateBr(Loop);
   }
-  SwitchInst *SW = FB.CreateSwitch(Op, Trap, 16);
+  SwitchInst *SW = FB.CreateSwitch(Op, Trap, 20);
   // OP_NOP (fake instruction): fetch it, skip it, keep running.  Without an
   // explicit case it would fall to Trap and silently halt the VM.
   SW->addCase(ci8(V.op(OP_NOP)), Fetch);
@@ -1363,10 +1454,13 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   SW->addCase(ci8(V.op(OP_CAST)), HCast);
   SW->addCase(ci8(V.op(OP_SELECT)), HSel);
   SW->addCase(ci8(V.op(OP_UNREACHABLE)), HUnr);
+  SW->addCase(ci8(V.op(OP_ATOMICRMW)), HRmw);
+  SW->addCase(ci8(V.op(OP_CMPXCHG)), HCxg);
+  SW->addCase(ci8(V.op(OP_COPY)), HCopy);
 
   auto callEval = [&](IRBuilder<> &B, Value *SizeOut = nullptr) -> Value * {
     if (!SizeOut) {
-      AllocaInst *Tmp = B.CreateAlloca(I8);
+      AllocaInst *Tmp = entryAlloca8();
       SizeOut = Tmp;
     }
     return B.CreateCall(EvalFn, {Code, IP, Data, SizeOut, CodeState});
@@ -1380,11 +1474,20 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   auto getU = [&](IRBuilder<> &B) {
     return irGetU64(B, I8, I32, I64, Code, IP, Encrypt ? CodeState : nullptr);
   };
+  auto getU32raw = [&](IRBuilder<> &B) -> Value * {
+    Value *Acc = ConstantInt::get(I32, 0);
+    for (unsigned I = 0; I < 4; ++I) {
+      Value *Byte = getB(B);
+      Acc = B.CreateOr(Acc, B.CreateShl(B.CreateZExt(Byte, I32),
+                                        ConstantInt::get(I32, 8 * I)));
+    }
+    return Acc;
+  };
 
   // ALLOCA
   {
     IRBuilder<> B(HAlloca);
-    AllocaInst *SzT = B.CreateAlloca(I8);
+    AllocaInst *SzT = entryAlloca8();
     Value *ResOff = callReadVar(B, SzT);
     Value *AreaOff = getU(B);
     Value *VA = B.CreatePtrToInt(B.CreateGEP(I8, Data, AreaOff), I64);
@@ -1395,7 +1498,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   // LOAD
   {
     IRBuilder<> B(HLoad);
-    AllocaInst *SzT = B.CreateAlloca(I8);
+    AllocaInst *SzT = entryAlloca8();
     Value *ResOff = callReadVar(B, SzT);
     Value *Sz = B.CreateLoad(I8, SzT);
     Value *Addr = callEval(B);
@@ -1417,8 +1520,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
 
     Value *Size = getB(B);
     Value *Tid = getB(B);
-    AllocaInst *SzA = B.CreateAlloca(I8);
-    AllocaInst *ValA = B.CreateAlloca(I64);
+    AllocaInst *SzA = entryAlloca8();
+    AllocaInst *ValA = entryAlloca64();
     B.CreateStore(Size, SzA);
     B.CreateCondBr(B.CreateICmpEQ(Tid, ConstantInt::get(I8, 0)), SVar, SCst);
 
@@ -1429,8 +1532,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     SV.CreateBr(SJoin);
 
     IRBuilder<> SC(SCst);
-    AllocaInst *IdxA = SC.CreateAlloca(I32);
-    AllocaInst *AccA = SC.CreateAlloca(I64);
+    AllocaInst *IdxA = entryAlloca32();
+    AllocaInst *AccA = entryAlloca64();
     SC.CreateStore(ConstantInt::get(I32, 0), IdxA);
     SC.CreateStore(ConstantInt::get(I64, 0), AccA);
     SC.CreateBr(SCLoop);
@@ -1466,7 +1569,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     IRBuilder<> B(HBin);
     Value *Sub = getB(B);
-    AllocaInst *SzT = B.CreateAlloca(I8);
+    AllocaInst *SzT = entryAlloca8();
     Value *ResOff = callReadVar(B, SzT);
     Value *Sz = B.CreateLoad(I8, SzT);
     // Operands exist in two shapes and the opcode decides which one is right.
@@ -1477,8 +1580,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     //  * signed ops (sdiv/srem/ashr) need the sign-extended form.
     //  * add/sub/mul/shl/and/or/xor agree on the low Sz bytes either way, so
     //    the zero-extended pair keeps them well defined.
-    AllocaInst *LSz = B.CreateAlloca(I8);
-    AllocaInst *RSz = B.CreateAlloca(I8);
+    AllocaInst *LSz = entryAlloca8();
+    AllocaInst *RSz = entryAlloca8();
     Value *LHSU = maskToSize(B, I8, I64, callEval(B, LSz), Sz);
     Value *RHSU = maskToSize(B, I8, I64, callEval(B, RSz), Sz);
     Value *LHSS = sextToI64(B, I8, I64, LHSU, Sz);
@@ -1486,7 +1589,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
 
     auto *Def = BasicBlock::Create(Ctx, "", Host);
     auto *Join = BasicBlock::Create(Ctx, "", Host);
-    AllocaInst *RA = B.CreateAlloca(I64);
+    AllocaInst *RA = entryAlloca64();
     SwitchInst *BS = B.CreateSwitch(Sub, Def, 13);
 
     auto add = [&](uint8_t CodeV, auto Fn, Value *L, Value *R) {
@@ -1524,10 +1627,10 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     IRBuilder<> B(HIcmp);
     Value *Pred = getB(B);
-    AllocaInst *SzT = B.CreateAlloca(I8);
+    AllocaInst *SzT = entryAlloca8();
     Value *ResOff = callReadVar(B, SzT);
-    AllocaInst *LSz = B.CreateAlloca(I8);
-    AllocaInst *RSz = B.CreateAlloca(I8);
+    AllocaInst *LSz = entryAlloca8();
+    AllocaInst *RSz = entryAlloca8();
     Value *LHS0 = callEval(B, LSz);
     Value *RHS0 = callEval(B, RSz);
     Value *LSzV = B.CreateLoad(I8, LSz);
@@ -1539,7 +1642,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     Value *RHSS = sextToI64(B, I8, I64, RHSZ, RSzV);
     auto *Def = BasicBlock::Create(Ctx, "", Host);
     auto *Join = BasicBlock::Create(Ctx, "", Host);
-    AllocaInst *RA = B.CreateAlloca(I8);
+    AllocaInst *RA = entryAlloca8();
     SwitchInst *IS = B.CreateSwitch(Pred, Def, 10);
     auto addU = [&](uint8_t C, auto Fn) {
       auto *BB = BasicBlock::Create(Ctx, "", Host);
@@ -1627,10 +1730,10 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     IRBuilder<> B(HGep);
     Value *Kind = getB(B);
     Value *ElemSz = getU(B);
-    AllocaInst *SzT = B.CreateAlloca(I8);
+    AllocaInst *SzT = entryAlloca8();
     Value *ResOff = callReadVar(B, SzT);
     Value *Base = callEval(B);
-    AllocaInst *DispSz = B.CreateAlloca(I8);
+    AllocaInst *DispSz = entryAlloca8();
     Value *DispRaw = callEval(B, DispSz);
     // GEP indices are signed, and the field is a raw byte offset for kind 0, so
     // the displacement is sign-extended from its own width.  Reading it
@@ -1659,16 +1762,16 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     IRBuilder<> B(HCast);
     Value *Kind = getB(B);
-    AllocaInst *SzT = B.CreateAlloca(I8);
+    AllocaInst *SzT = entryAlloca8();
     Value *ResOff = callReadVar(B, SzT);
     Value *DstSz = B.CreateLoad(I8, SzT);
-    AllocaInst *SrcSzT = B.CreateAlloca(I8);
+    AllocaInst *SrcSzT = entryAlloca8();
     Value *Src = callEval(B, SrcSzT);
     Value *SrcSz = B.CreateLoad(I8, SrcSzT);
     auto *SextBB = BasicBlock::Create(Ctx, "", Host);
     auto *NormBB = BasicBlock::Create(Ctx, "", Host);
     auto *Join = BasicBlock::Create(Ctx, "", Host);
-    AllocaInst *RA = B.CreateAlloca(I64);
+    AllocaInst *RA = entryAlloca64();
     B.CreateCondBr(B.CreateICmpEQ(Kind, ConstantInt::get(I8, CAST_SEXT)), SextBB,
                    NormBB);
     IRBuilder<> CS(SextBB);
@@ -1691,7 +1794,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   // SELECT
   {
     IRBuilder<> B(HSel);
-    AllocaInst *SzT = B.CreateAlloca(I8);
+    AllocaInst *SzT = entryAlloca8();
     Value *ResOff = callReadVar(B, SzT);
     Value *Sz = B.CreateLoad(I8, SzT);
     Value *Cond = callEval(B);
@@ -1704,12 +1807,91 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   }
 
   {
-    IRBuilder<> B(HUnr);
+    IRBuilder<> B(Trap);
     B.CreateStore(ConstantInt::get(I8, 0), Run);
     B.CreateBr(Loop);
   }
+  // ATOMICRMW: [subop u8][packed var sz,res][ptr][val].  A true LLVM
+  // AtomicRMW on the target cell (correct under concurrency), acq_rel is a
+  // safe conservative upgrade of weaker orderings.
   {
-    IRBuilder<> B(Trap);
+    IRBuilder<> B(HRmw);
+    Value *Sub = getB(B);
+    AllocaInst *SzT = entryAlloca8();
+    Value *ResOff = callReadVar(B, SzT);
+    Value *Sz = B.CreateLoad(I8, SzT);
+    Value *Addr = callEval(B);
+    Value *Val = callEval(B);
+    Value *ValI64 = B.CreateZExt(Val, I64);
+    BasicBlock *Arms[11];
+    AtomicRMWInst::BinOp Ops[11] = {
+        AtomicRMWInst::Xchg, AtomicRMWInst::Add,  AtomicRMWInst::Sub,
+        AtomicRMWInst::And,  AtomicRMWInst::Or,   AtomicRMWInst::Xor,
+        AtomicRMWInst::Nand, AtomicRMWInst::Max,  AtomicRMWInst::Min,
+        AtomicRMWInst::UMax, AtomicRMWInst::UMin};
+    for (unsigned K = 0; K < 11; ++K)
+      Arms[K] = BasicBlock::Create(Ctx, "", Host);
+    auto *Def = BasicBlock::Create(Ctx, "", Host);
+    SwitchInst *SubSw = B.CreateSwitch(Sub, Def, 11);
+    for (unsigned K = 0; K < 11; ++K)
+      SubSw->addCase(B.getInt8(K), Arms[K]);
+    for (unsigned K = 0; K < 11; ++K) {
+      IRBuilder<> AB(Arms[K]);
+      Value *Ptr = AB.CreateIntToPtr(Addr, AB.getPtrTy());
+      Value *TyVal = AB.CreateTrunc(ValI64, AB.getInt32Ty());
+      Value *Old = AB.CreateAtomicRMW(Ops[K], Ptr, TyVal, MaybeAlign(),
+                                      AtomicOrdering::AcquireRelease,
+                                      SyncScope::System);
+      irStoreBytes(AB, I8, I64, Data, ResOff, AB.CreateZExt(Old, I64), Sz);
+      AB.CreateBr(Loop);
+    }
+    IRBuilder<> DB(Def);
+    DB.CreateStore(ConstantInt::get(I8, 0), Run);
+    DB.CreateBr(Loop);
+  }
+  // CMPXCHG: [sz u8][reserved u8][ptr][cmp][new].  Writes old value and the
+  // success flag into side-map slots; users extract them via OP_COPY.
+  {
+    IRBuilder<> B(HCxg);
+    AllocaInst *SzT = entryAlloca8();
+    B.CreateStore(getB(B), SzT);
+    Value *Sz = B.CreateLoad(I8, SzT);
+    Value *Addr = callEval(B);
+    Value *Cmp = callEval(B);
+    Value *New = callEval(B);
+    Value *OldOff = B.CreateZExt(getU32raw(B), I64);
+    Value *FlagOff = B.CreateZExt(getU32raw(B), I64);
+    Value *Ptr = B.CreateIntToPtr(Addr, B.getPtrTy());
+    Value *CmpV = B.CreateZExt(Cmp, I64);
+    Value *NewV = B.CreateZExt(New, I64);
+    Value *CmpC = B.CreateTrunc(CmpV, B.getInt32Ty());
+    Value *NewC = B.CreateTrunc(NewV, B.getInt32Ty());
+    Value *Old = B.CreateAtomicCmpXchg(Ptr, CmpC, NewC, MaybeAlign(),
+                                       AtomicOrdering::AcquireRelease,
+                                       AtomicOrdering::Acquire,
+                                       SyncScope::System);
+    Value *OldV = B.CreateExtractValue(Old, 0);
+    Value *OkV = B.CreateExtractValue(Old, 1);
+    irStoreBytes(B, I8, I64, Data, OldOff, B.CreateZExt(OldV, I64), Sz);
+    irStoreBytes(B, I8, I64, Data, FlagOff, B.CreateZExt(OkV, I64),
+                 ConstantInt::get(I8, 1));
+    B.CreateBr(Loop);
+  }
+  // COPY: [packed var sz,res][src u32] — move a data-area cell (used for
+  // extractvalue of a cmpxchg pair).
+  {
+    IRBuilder<> B(HCopy);
+    AllocaInst *SzT = entryAlloca8();
+    Value *ResOff = callReadVar(B, SzT);
+    Value *Sz = B.CreateLoad(I8, SzT);
+    // src offset is a raw u32 on the wire
+    Value *SrcOff = B.CreateZExt(getU32raw(B), I64);
+    Value *V = irLoadBytes(B, I8, I64, Data, SrcOff, Sz);
+    irStoreBytes(B, I8, I64, Data, ResOff, V, Sz);
+    B.CreateBr(Loop);
+  }
+  {
+    IRBuilder<> B(HUnr);
     B.CreateStore(ConstantInt::get(I8, 0), Run);
     B.CreateBr(Loop);
   }
@@ -1736,6 +1918,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
       verifyFunction(*CallHandler, &errs()) ||
       verifyFunction(*SeedReloadFn, &errs())) {
     errs() << "[VMP] verify failed for " << Host->getName() << "\n";
+    // Print the real verifier diagnostics above this line (they go to errs
+    // from verifyFunction already).
     return false;
   }
   return true;
