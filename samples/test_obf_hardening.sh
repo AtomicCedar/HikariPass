@@ -87,5 +87,19 @@ check "T7-simple-jni-onload-virtualized" $r
 python3 "$ROOT/samples/check_handler_shuffle.py" >/dev/null 2>&1
 check "T8-handler-shuffle" $?
 
+# T9: strings referenced only through a global POINTER variable
+# (const char *g = "..."; return g;) must also be encrypted.
+cat > "$OUT/gvar.c" <<'GEOF'
+const char *g = "through global ptr secret";
+const char *getg(void){ return g; }
+__attribute__((annotate("strenc")))
+const char *main2(void){ return getg(); }
+GEOF
+clang -O0 -emit-llvm -S "$OUT/gvar.c" -o "$OUT/gvar.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-strcry)' "$OUT/gvar.ll" -o "$OUT/gvar.bc" 2>/dev/null
+llvm-dis "$OUT/gvar.bc" -o "$OUT/gvar_o.ll"
+if grep -q "through global ptr secret" "$OUT/gvar_o.ll"; then r=1; else r=0; fi
+check "T9-global-ptr-string-encrypted" $r
+
 rm -rf "$OUT"
 exit $FAIL

@@ -149,9 +149,47 @@ struct StringEncryption : public ModulePass {
           Users.insert(U2);
         Users.insert(U);
         Globals.emplace_back(G);
+        // A global POINTER variable (e.g. `static const char *g = "str";` or
+        // an extern pointer with a private string initializer) hides the
+        // actual string behind its initializer. Even when the pointer GV
+        // itself is not handleable (external linkage), the pointed-to
+        // constant is private and must be collected for encryption.
+        collectPointeeStrings(G, Globals);
       } else if (User *U = dyn_cast<User>(Op)) {
         if (!VisitedUsers.count(U))
           HandleUser(U, Globals, Users, VisitedUsers);
+      }
+    }
+  }
+
+  // Follow a global's initializer if it is (or wraps) a pointer to another
+  // global; those pointee strings would otherwise stay plaintext.
+  void collectPointeeStrings(GlobalVariable *G,
+                             SmallVector<GlobalVariable *, 32> &Globals) {
+    if (!G->hasInitializer())
+      return;
+    Constant *Init = G->getInitializer()->stripPointerCasts();
+    SmallVector<Constant *, 8> Worklist;
+    Worklist.push_back(Init);
+    SmallPtrSet<Constant *, 8> Seen;
+    while (!Worklist.empty()) {
+      Constant *C = Worklist.pop_back_val();
+      if (!C || !Seen.insert(C).second)
+        continue;
+      if (GlobalVariable *P = dyn_cast<GlobalVariable>(C)) {
+        Globals.emplace_back(P);
+        if (P->hasInitializer())
+          Worklist.push_back(P->getInitializer()->stripPointerCasts());
+        continue;
+      }
+      if (ConstantAggregate *CA = dyn_cast<ConstantAggregate>(C)) {
+        for (Value *Elem : CA->operands())
+          if (Constant *EC = dyn_cast<Constant>(Elem))
+            Worklist.push_back(EC->stripPointerCasts());
+      } else if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+        for (Value *Elem : CE->operands())
+          if (Constant *EC = dyn_cast<Constant>(Elem))
+            Worklist.push_back(EC->stripPointerCasts());
       }
     }
   }
