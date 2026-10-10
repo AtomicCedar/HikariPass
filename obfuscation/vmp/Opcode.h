@@ -24,6 +24,9 @@ enum Op : uint8_t {
   OP_UNREACHABLE = 0x0E,
   OP_CMPXCHG = 0x0F,
   OP_COPY = 0x10,
+  OP_FBINOP = 0x11,
+  OP_FCMP = 0x12,
+  OP_FCAST = 0x13,
 };
 
 enum BinSubOp : uint8_t {
@@ -79,6 +82,25 @@ enum RmwSubOp : uint8_t {
   RMW_MIN = 8,
   RMW_UMAX = 9,
   RMW_UMIN = 10,
+};
+
+// Float binop sub-ops (wire format; values shared with FCmp preds are NOT
+// assumed).  Operands/results are IEEE-754 bit patterns in data slots.
+enum FBinSubOp : uint8_t {
+  FB_ADD = 0,
+  FB_SUB = 1,
+  FB_MUL = 2,
+  FB_DIV = 3,
+};
+
+// Float cast kinds.
+enum FCastKind : uint8_t {
+  FC_FPEXT = 0,   // float -> double
+  FC_FPTRUNC = 1, // double -> float
+  FC_SITOFP = 2,  // int -> float/double (dest size picks)
+  FC_FPTOSI = 3,  // float/double -> int (dest size picks)
+  FC_FPTOUI = 4,
+  FC_UITOFP = 5,
 };
 
 static constexpr unsigned kPointerSize = 8;

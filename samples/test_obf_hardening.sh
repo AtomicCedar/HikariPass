@@ -134,5 +134,41 @@ if grep -q "build fail\|translate fail" "$OUT/atomic_loop.err"; then r=1; else
 fi
 check "T10-atomic-longloop-stress" $r
 
+# T11: floating-point IR must be virtualized, not skipped.
+# A float function (fadd/fmul/fcmp) previously hard-failed the whole
+# function, leaving it completely unprotected. Verify the VM runs it and
+# produces exact results (including an fcmp branch).
+cat > "$OUT/float_calc.c" <<'FEOF'
+#include <stddef.h>
+__attribute__((annotate("vmp")))
+double calc(double a, double b) {
+  double x = a * b + 3.5;
+  if (x > 10.0)
+    x = x / 2.0;
+  return x;
+}
+__attribute__((annotate("vmp")))
+float fcalc(float a, float b) {
+  return a / b - 1.5f;
+}
+int main(void) {
+  // calc(4,4)=19.5>10 -> 9.75 ; calc(2,3)=9.5 ; fcalc(7,2)=2.0
+  if (calc(4.0, 4.0) != 9.75) return 1;
+  if (calc(2.0, 3.0) != 9.5) return 2;
+  if (fcalc(7.0f, 2.0f) != 2.0f) return 3;
+  return 0;
+}
+FEOF
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/float_calc.c" -o "$OUT/float_calc.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/float_calc.ll" \
+  -o "$OUT/float_calc.bc" 2>"$OUT/float_calc.err"
+r=1
+if grep -q "skip calc\|floating-point IR unsupported" "$OUT/float_calc.err"; then r=1; else
+  llc -filetype=obj "$OUT/float_calc.bc" -o "$OUT/float_calc.o" 2>/dev/null && \
+  clang -no-pie "$OUT/float_calc.o" -o "$OUT/float_calc_run" 2>/dev/null && \
+  "$OUT/float_calc_run" >/dev/null 2>&1 && r=0
+fi
+check "T11-float-virtualized" $r
+
 rm -rf "$OUT"
 exit $FAIL

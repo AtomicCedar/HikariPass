@@ -187,7 +187,7 @@ struct VMPContext {
   // Per-function opcode mapping: wire[k] = the byte value that stands for
   // Opcode k in this function's bytecode.  Derived from the function name and
   // HIKARI_SEED so every function (and every build) gets a unique encoding.
-  uint8_t WireOp[17] = {0};
+  uint8_t WireOp[20] = {0};
   bool FakeInst = true;
   uint32_t FakeState = 0;
   // cmpxchg results are {old, i1} structs: remember both slots so
@@ -202,7 +202,7 @@ struct VMPContext {
     bool Used[256] = {false};
     Used[0] = true;
     WireOp[0] = 0;
-    for (unsigned K = 1; K < 17; ++K) {
+    for (unsigned K = 1; K < 20; ++K) {
       uint8_t V;
       do {
         V = static_cast<uint8_t>(fnNext(&S) & 0xFF);
@@ -269,7 +269,8 @@ static bool isIntOK(Type *Ty) {
 }
 
 static bool isTypeOK(Type *Ty) {
-  return Ty->isVoidTy() || Ty->isPointerTy() || isIntOK(Ty);
+  return Ty->isVoidTy() || Ty->isPointerTy() || isIntOK(Ty) ||
+         Ty->isFloatTy() || Ty->isDoubleTy();
 }
 
 static std::optional<uint8_t> mapBin(unsigned Op) {
@@ -333,6 +334,26 @@ static void emitOperand(VMPContext &C, Value *V) {
     emitPackedConst(C.Code, Sz, CI->getZExtValue());
     return;
   }
+  if (auto *CF = dyn_cast<ConstantFP>(V)) {
+    // Floats ride the wire as their IEEE-754 bit pattern in an 8-byte
+    // slot-width constant.  float constants keep their 32-bit bits in the
+    // LOW half (the float arm truncs to i32 and bitcasts); doubles use the
+    // full 64 bits.
+    uint64_t Bits;
+    if (CF->getType()->isFloatTy()) {
+      float F = CF->getValueAPF().convertToFloat();
+      uint32_t B32;
+      static_assert(sizeof(B32) == sizeof(F), "32-bit float required");
+      memcpy(&B32, &F, sizeof(B32));
+      Bits = B32;
+    } else {
+      double D = CF->getValueAPF().convertToDouble();
+      static_assert(sizeof(Bits) == sizeof(D), "64-bit double required");
+      memcpy(&Bits, &D, sizeof(Bits));
+    }
+    emitPackedConst(C.Code, 8, Bits);
+    return;
+  }
   if (isa<ConstantPointerNull>(V)) {
     emitPackedConst(C.Code, kPointerSize, 0);
     return;
@@ -360,6 +381,12 @@ static void emitOperand(VMPContext &C, Value *V) {
   }
   uint8_t Sz = static_cast<uint8_t>(std::max(1u, C.typeSize(V->getType())));
   emitPackedVar(C.Code, Sz, C.off(V));
+}
+
+// Emit an operand that refers to a raw data-area slot (used when a synthetic
+// value has no corresponding IR Value).
+static void emitOperandRaw(VMPContext &C, uint32_t Off, uint32_t Sz) {
+  emitPackedVar(C.Code, static_cast<uint8_t>(std::max(1u, Sz)), Off);
 }
 
 static CallArgInfo captureArg(VMPContext &C, Value *V) {
@@ -455,6 +482,128 @@ static bool translateInst(VMPContext &C, Instruction *I) {
     if (SI->isAtomic())
       C.emitOp(OP_FENCE);
     return true;
+  }
+
+  // Float ops first: scalar FPMathOperator/FCmp/FP-casts map to the float
+  // opcodes; the integer branches below must not see them.
+  if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+    if (BO->getType()->isFloatingPointTy()) {
+      if (BO->getType()->isVectorTy() ||
+          (!BO->getType()->isFloatTy() && !BO->getType()->isDoubleTy()) ||
+          BO->getOperand(0)->getType() != BO->getType())
+        return C.fail("bad float binop type"), false;
+      uint8_t Sub;
+      switch (BO->getOpcode()) {
+      case Instruction::FAdd: Sub = FB_ADD; break;
+      case Instruction::FSub: Sub = FB_SUB; break;
+      case Instruction::FMul: Sub = FB_MUL; break;
+      case Instruction::FDiv: Sub = FB_DIV; break;
+      default:
+        return C.fail("float binop op"), false;
+      }
+      uint32_t Sz = C.typeSize(BO->getType());
+      uint32_t Res = C.allocSlot(Sz, C.typeAlign(BO->getType()));
+      C.map(BO, Res);
+      C.emitOp(OP_FBINOP);
+      emitU8(C.Code, Sub);
+      emitPackedVar(C.Code, static_cast<uint8_t>(Sz), Res);
+      emitOperand(C, BO->getOperand(0));
+      emitOperand(C, BO->getOperand(1));
+      return true;
+    }
+  }
+
+  if (auto *FC = dyn_cast<FCmpInst>(I)) {
+    if (!FC->getOperand(0)->getType()->isFloatTy() &&
+        !FC->getOperand(0)->getType()->isDoubleTy())
+      return C.fail("bad fcmp type"), false;
+    // Ordered/unordered mapping: emit the LLVM predicate; the interpreter
+    // evaluates it with the same semantics.
+    uint8_t P = static_cast<uint8_t>(FC->getPredicate());
+    uint32_t Res = C.allocSlot(1, Align(1));
+    C.map(FC, Res);
+    C.emitOp(OP_FCMP);
+    emitU8(C.Code, P);
+    emitPackedVar(C.Code, 1, Res);
+    emitOperand(C, FC->getOperand(0));
+    emitOperand(C, FC->getOperand(1));
+    return true;
+  }
+
+  if (auto *Cast = dyn_cast<CastInst>(I)) {
+    if (Cast->getType()->isFloatingPointTy() ||
+        Cast->getOperand(0)->getType()->isFloatingPointTy()) {
+      Type *STy = Cast->getOperand(0)->getType();
+      Type *DTy = Cast->getType();
+      bool SrcFP = STy->isFloatTy() || STy->isDoubleTy();
+      bool DstFP = DTy->isFloatTy() || DTy->isDoubleTy();
+      if (STy->isVectorTy() || DTy->isVectorTy())
+        return C.fail("bad float cast type"), false;
+      // FP<->FP and Int<->FP both route through OP_FCAST; the kind encodes
+      // the direction and the dest size disambiguates 32/64 widths.
+      if (Cast->getOpcode() == Instruction::SIToFP ||
+          Cast->getOpcode() == Instruction::UIToFP) {
+        if (!(STy->isIntegerTy() && DstFP))
+          return C.fail("bad float cast type"), false;
+      } else if (Cast->getOpcode() == Instruction::FPToSI ||
+                 Cast->getOpcode() == Instruction::FPToUI) {
+        if (!(SrcFP && DTy->isIntegerTy()))
+          return C.fail("bad float cast type"), false;
+      } else if (!(SrcFP && DstFP)) {
+        return C.fail("bad float cast type"), false;
+      }
+      uint8_t Kind;
+      switch (Cast->getOpcode()) {
+      case Instruction::FPExt:   Kind = FC_FPEXT; break;
+      case Instruction::FPTrunc: Kind = FC_FPTRUNC; break;
+      case Instruction::SIToFP:  Kind = FC_SITOFP; break;
+      case Instruction::FPToSI:  Kind = FC_FPTOSI; break;
+      case Instruction::FPToUI:  Kind = FC_FPTOUI; break;
+      case Instruction::UIToFP:  Kind = FC_UITOFP; break;
+      default:
+        return C.fail("float cast op"), false;
+      }
+      uint32_t DSz = C.typeSize(DTy);
+      uint32_t Res = C.allocSlot(DSz, C.typeAlign(DTy));
+      C.map(Cast, Res);
+      C.emitOp(OP_FCAST);
+      emitU8(C.Code, Kind);
+      emitPackedVar(C.Code, static_cast<uint8_t>(DSz), Res);
+      emitOperand(C, Cast->getOperand(0));
+      return true;
+    }
+  }
+
+  // llvm.fmuladd.* / llvm.fma.* — expand to FMUL then FADD (default NAN
+  // semantics: unfused is a legal, slightly less precise evaluation and
+  // matches what the surrounding non-virtualized code may not rely on).
+  if (auto *CI = dyn_cast<CallInst>(I)) {
+    if (Function *Callee = CI->getCalledFunction()) {
+      Intrinsic::ID IID = Callee->getIntrinsicID();
+      if (IID == Intrinsic::fmuladd || IID == Intrinsic::fma) {
+        Type *Ty = CI->getType();
+        if (!Ty->isFloatTy() && !Ty->isDoubleTy())
+          return C.fail("bad fma type"), false;
+        uint32_t MSz = C.typeSize(Ty);
+        uint32_t MRes = C.allocSlot(MSz, C.typeAlign(Ty));
+        // Emit as FMUL op followed by FADD op reusing the same translator
+        // by constructing temporary binary ops is intrusive; instead emit
+        // two ops manually.
+        C.emitOp(OP_FBINOP);
+        emitU8(C.Code, FB_MUL);
+        emitPackedVar(C.Code, static_cast<uint8_t>(MSz), MRes);
+        emitOperand(C, CI->getArgOperand(0));
+        emitOperand(C, CI->getArgOperand(1));
+        uint32_t ARes = C.allocSlot(MSz, C.typeAlign(Ty));
+        C.map(CI, ARes);
+        C.emitOp(OP_FBINOP);
+        emitU8(C.Code, FB_ADD);
+        emitPackedVar(C.Code, static_cast<uint8_t>(MSz), ARes);
+        emitOperandRaw(C, MRes, MSz);
+        emitOperand(C, CI->getArgOperand(2));
+        return true;
+      }
+    }
   }
 
   if (auto *BO = dyn_cast<BinaryOperator>(I)) {
@@ -1119,6 +1268,9 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   auto *HRmw = BasicBlock::Create(Ctx, "", Host);
   auto *HCxg = BasicBlock::Create(Ctx, "", Host);
   auto *HCopy = BasicBlock::Create(Ctx, "", Host);
+  auto *HFBin = BasicBlock::Create(Ctx, "", Host);
+  auto *HFCmp = BasicBlock::Create(Ctx, "", Host);
+  auto *HFCast = BasicBlock::Create(Ctx, "", Host);
   (void)0;
 
   // Handler shuffling: physically reorder the handler BBs in the function
@@ -1127,7 +1279,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     BasicBlock *Handlers[] = {HAlloca, HLoad,  HStore, HBin, HIcmp,
                               HBr,     HRet,   HGep,   HCall, HCast,
-                              HSel,    HUnr,   HRmw,   HCxg,  HCopy};
+                              HSel,    HUnr,   HRmw,   HCxg,  HCopy,
+                              HFBin,   HFCmp,  HFCast};
     constexpr unsigned N = sizeof(Handlers) / sizeof(Handlers[0]);
     uint32_t SS = fnHashSeed((Twine("shuffle|") + Host->getName()).str());
     if (!SS) SS = 0x9E3779B9;
@@ -1228,6 +1381,9 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     if (Arg.getType()->isPointerTy()) {
       Value *AsInt = EB.CreatePtrToInt(&Arg, I64);
       EB.CreateStore(AsInt, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
+    } else if (Arg.getType()->isFloatTy()) {
+      Value *Bits = EB.CreateZExt(EB.CreateBitCast(&Arg, EB.getInt32Ty()), I64);
+      EB.CreateStore(Bits, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
     } else {
       EB.CreateStore(&Arg, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
     }
@@ -1457,6 +1613,9 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   SW->addCase(ci8(V.op(OP_ATOMICRMW)), HRmw);
   SW->addCase(ci8(V.op(OP_CMPXCHG)), HCxg);
   SW->addCase(ci8(V.op(OP_COPY)), HCopy);
+  SW->addCase(ci8(V.op(OP_FBINOP)), HFBin);
+  SW->addCase(ci8(V.op(OP_FCMP)), HFCmp);
+  SW->addCase(ci8(V.op(OP_FCAST)), HFCast);
 
   auto callEval = [&](IRBuilder<> &B, Value *SizeOut = nullptr) -> Value * {
     if (!SizeOut) {
@@ -1890,6 +2049,235 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     irStoreBytes(B, I8, I64, Data, ResOff, V, Sz);
     B.CreateBr(Loop);
   }
+
+  // FBINOP: [subop u8][packed var sz,res][a][b].  4-byte slots are float,
+  // 8-byte slots are double.  Results stored back as IEEE bits.
+  // Subop dispatch is a select chain over eagerly-computed results — safe
+  // under default FP semantics (no trapping ops), avoids a 4-way block web.
+  {
+    IRBuilder<> B(HFBin);
+    Value *Sub = getB(B);
+    AllocaInst *SzT = entryAlloca8();
+    Value *ResOff = callReadVar(B, SzT);
+    Value *Sz = B.CreateLoad(I8, SzT);
+    Value *A = callEval(B);
+    Value *Bv = callEval(B);
+    BasicBlock *S32 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *S64 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *SDef = BasicBlock::Create(Ctx, "", Host);
+    {
+      auto *SzSw = B.CreateSwitch(B.CreateICmpEQ(Sz, ConstantInt::get(I8, 4)),
+                                  S64, 1);
+      SzSw->addCase(cast<ConstantInt>(ConstantInt::get(B.getInt1Ty(), 1)), S32);
+    } // sz==4 -> S32 (float), sz==8 -> S64 (double)
+    IRBuilder<> B32(S32);
+    {
+      Value *RA = B32.CreateBitCast(B32.CreateTrunc(A, B32.getInt32Ty()),
+                                    B32.getFloatTy());
+      Value *RB = B32.CreateBitCast(B32.CreateTrunc(Bv, B32.getInt32Ty()),
+                                    B32.getFloatTy());
+      Value *VAdd = B32.CreateFAdd(RA, RB);
+      Value *VSub = B32.CreateFSub(RA, RB);
+      Value *VMul = B32.CreateFMul(RA, RB);
+      Value *VDiv = B32.CreateFDiv(RA, RB);
+      Value *R = B32.CreateSelect(B32.CreateICmpEQ(Sub, ConstantInt::get(I8, FB_ADD)), VAdd,
+                      B32.CreateSelect(B32.CreateICmpEQ(Sub, ConstantInt::get(I8, FB_SUB)), VSub,
+                        B32.CreateSelect(B32.CreateICmpEQ(Sub, ConstantInt::get(I8, FB_MUL)), VMul, VDiv)));
+      Value *RBits = B32.CreateZExt(B32.CreateBitCast(R, B32.getInt32Ty()), I64);
+      irStoreBytes(B32, I8, I64, Data, ResOff, RBits, ConstantInt::get(I8, 4));
+      B32.CreateBr(Loop);
+    }
+    // double arm
+    B.SetInsertPoint(S64);
+    {
+      Value *RA = B.CreateBitCast(A, B.getDoubleTy());
+      Value *RB = B.CreateBitCast(Bv, B.getDoubleTy());
+      Value *VAdd = B.CreateFAdd(RA, RB);
+      Value *VSub = B.CreateFSub(RA, RB);
+      Value *VMul = B.CreateFMul(RA, RB);
+      Value *VDiv = B.CreateFDiv(RA, RB);
+      Value *R = B.CreateSelect(B.CreateICmpEQ(Sub, ConstantInt::get(I8, FB_ADD)), VAdd,
+                    B.CreateSelect(B.CreateICmpEQ(Sub, ConstantInt::get(I8, FB_SUB)), VSub,
+                      B.CreateSelect(B.CreateICmpEQ(Sub, ConstantInt::get(I8, FB_MUL)), VMul, VDiv)));
+      Value *RBits = B.CreateBitCast(R, I64);
+      irStoreBytes(B, I8, I64, Data, ResOff, RBits, Sz);
+      B.CreateBr(Loop);
+    }
+    B.SetInsertPoint(SDef);
+    B.CreateStore(ConstantInt::get(I8, 0), Run);
+    B.CreateBr(Loop);
+  }
+
+  // FCMP: [pred u8][packed var 1,res][a][b] — evaluate the LLVM float
+  // predicate (ordered/unordered NaN semantics included) and store 0/1.
+  {
+    IRBuilder<> B(HFCmp);
+    Value *Pred = getB(B);
+    AllocaInst *SzT = entryAlloca8();
+    Value *ResOff = callReadVar(B, SzT);
+    Value *Sz = B.CreateLoad(I8, SzT);
+    Value *A = callEval(B);
+    Value *Bv = callEval(B);
+    auto evalCmp = [&](IRBuilder<> &B, Type *FTy, Value *A, Value *Bv,
+                       Value *Pred) -> Value * {
+      Value *RA = B.CreateBitCast(A, FTy);
+      Value *RB = B.CreateBitCast(Bv, FTy);
+      Value *False = ConstantInt::get(B.getInt8Ty(), 0);
+      Value *True = ConstantInt::get(B.getInt8Ty(), 1);
+      // Emit every predicate select-chained; only the matching one survives.
+      // LLVM FCMP_* enum 1..14 covers the real predicates (F/T excluded).
+      Value *R = False;
+      for (unsigned P = 1; P <= 14; ++P) {
+        Value *C = B.CreateFCmp(static_cast<CmpInst::Predicate>(P), RA, RB);
+        R = B.CreateSelect(B.CreateICmpEQ(Pred, ConstantInt::get(I8, P)),
+                           B.CreateSelect(C, True, False), R);
+      }
+      return R;
+    };
+    BasicBlock *S32 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *S64 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *SDef2 = BasicBlock::Create(Ctx, "", Host);
+    {
+      auto *SzSw = B.CreateSwitch(B.CreateICmpEQ(Sz, ConstantInt::get(I8, 4)),
+                                  S64, 1);
+      SzSw->addCase(cast<ConstantInt>(ConstantInt::get(B.getInt1Ty(), 1)), S32);
+    }
+    B.SetInsertPoint(S32);
+    {
+      Value *R = evalCmp(B, B.getFloatTy(), B.CreateTrunc(A, B.getInt32Ty()),
+                         B.CreateTrunc(Bv, B.getInt32Ty()), Pred);
+      irStoreBytes(B, I8, I64, Data, ResOff, B.CreateZExt(R, I64),
+                   ConstantInt::get(I8, 1));
+      B.CreateBr(Loop);
+    }
+    B.SetInsertPoint(S64);
+    {
+      Value *R = evalCmp(B, B.getDoubleTy(), A, Bv, Pred);
+      irStoreBytes(B, I8, I64, Data, ResOff, B.CreateZExt(R, I64),
+                   ConstantInt::get(I8, 1));
+      B.CreateBr(Loop);
+    }
+    B.SetInsertPoint(SDef2);
+    B.CreateStore(ConstantInt::get(I8, 0), Run);
+    B.CreateBr(Loop);
+  }
+
+  // FCAST: [kind u8][packed var dsz,res][src].  Block-level dispatch per
+  // kind (select chains over mixed FP widths are invalid IR).
+  {
+    AllocaInst *SzT = entryAlloca8();
+    BasicBlock *KDef = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KExt = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KTrunc = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KSi = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KFsi = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KFui = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KUi = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KSi32 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KSi64 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KFsi32 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KFsi64 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KFui32 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KFui64 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KUi32 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KUi64 = BasicBlock::Create(Ctx, "", Host);
+    IRBuilder<> B(HFCast);
+    Value *Kind = getB(B);
+    Value *ResOff = callReadVar(B, SzT);
+    Value *DSz = B.CreateLoad(I8, SzT);
+    Value *A = callEval(B);
+    // Deferred switch: emit after all case bodies exist so their blocks
+    // are populated with the single terminator each.
+    // (handled below, after the last case body)
+    auto store = [&](IRBuilder<> &KB, Value *BitsI64, Value *SzVal) {
+      irStoreBytes(KB, I8, I64, Data, ResOff, BitsI64, SzVal);
+      KB.CreateBr(Loop);
+    };
+    {
+      IRBuilder<> KB(KExt);
+      Value *F = KB.CreateBitCast(KB.CreateTrunc(A, KB.getInt32Ty()), KB.getFloatTy());
+      Value *D = KB.CreateFPExt(F, KB.getDoubleTy());
+      store(KB, KB.CreateBitCast(D, KB.getInt64Ty()), ConstantInt::get(I8, 8));
+    }
+    {
+      IRBuilder<> KB(KTrunc);
+      Value *D = KB.CreateBitCast(A, KB.getDoubleTy());
+      Value *F = KB.CreateFPTrunc(D, KB.getFloatTy());
+      store(KB, KB.CreateZExt(KB.CreateBitCast(F, KB.getInt32Ty()), I64),
+            ConstantInt::get(I8, 4));
+    }
+    {
+      IRBuilder<> KB(KSi);
+      KB.CreateCondBr(KB.CreateICmpEQ(DSz, ConstantInt::get(I8, 4)), KSi32, KSi64);
+    }
+    {
+      IRBuilder<> KB(KSi32);
+      Value *F = KB.CreateSIToFP(KB.CreateTrunc(A, KB.getInt32Ty()), KB.getFloatTy());
+      store(KB, KB.CreateZExt(KB.CreateBitCast(F, KB.getInt32Ty()), I64),
+            ConstantInt::get(I8, 4));
+    }
+    {
+      IRBuilder<> KB(KSi64);
+      Value *D = KB.CreateSIToFP(A, KB.getDoubleTy());
+      store(KB, KB.CreateBitCast(D, KB.getInt64Ty()), ConstantInt::get(I8, 8));
+    }
+    {
+      IRBuilder<> KB(KFsi);
+      KB.CreateCondBr(KB.CreateICmpEQ(DSz, ConstantInt::get(I8, 4)), KFsi32, KFsi64);
+    }
+    {
+      IRBuilder<> KB(KFsi32);
+      Value *F = KB.CreateBitCast(KB.CreateTrunc(A, KB.getInt32Ty()), KB.getFloatTy());
+      store(KB, KB.CreateZExt(KB.CreateFPToSI(F, KB.getInt32Ty()), I64),
+            ConstantInt::get(I8, 4));
+    }
+    {
+      IRBuilder<> KB(KFsi64);
+      Value *D = KB.CreateBitCast(A, KB.getDoubleTy());
+      store(KB, KB.CreateFPToSI(D, KB.getInt64Ty()), ConstantInt::get(I8, 8));
+    }
+    {
+      IRBuilder<> KB(KFui);
+      KB.CreateCondBr(KB.CreateICmpEQ(DSz, ConstantInt::get(I8, 4)), KFui32, KFui64);
+    }
+    {
+      IRBuilder<> KB(KFui32);
+      Value *F = KB.CreateBitCast(KB.CreateTrunc(A, KB.getInt32Ty()), KB.getFloatTy());
+      store(KB, KB.CreateZExt(KB.CreateFPToUI(F, KB.getInt32Ty()), I64),
+            ConstantInt::get(I8, 4));
+    }
+    {
+      IRBuilder<> KB(KFui64);
+      Value *D = KB.CreateBitCast(A, KB.getDoubleTy());
+      store(KB, KB.CreateFPToUI(D, KB.getInt64Ty()), ConstantInt::get(I8, 8));
+    }
+    {
+      IRBuilder<> KB(KUi);
+      KB.CreateCondBr(KB.CreateICmpEQ(DSz, ConstantInt::get(I8, 4)), KUi32, KUi64);
+    }
+    {
+      IRBuilder<> KB(KUi32);
+      Value *F = KB.CreateUIToFP(KB.CreateTrunc(A, KB.getInt32Ty()), KB.getFloatTy());
+      store(KB, KB.CreateZExt(KB.CreateBitCast(F, KB.getInt32Ty()), I64),
+            ConstantInt::get(I8, 4));
+    }
+    {
+      IRBuilder<> KB(KUi64);
+      Value *D = KB.CreateUIToFP(A, KB.getDoubleTy());
+      store(KB, KB.CreateBitCast(D, KB.getInt64Ty()), ConstantInt::get(I8, 8));
+    }
+    {
+      BasicBlock *CaseT[6] = {KExt, KTrunc, KSi, KFsi, KFui, KUi};
+      auto *SWF = B.CreateSwitch(Kind, KDef, 6);
+      for (unsigned K = 0; K < 6; ++K)
+        SWF->addCase(cast<ConstantInt>(ConstantInt::get(I8, K)), CaseT[K]);
+    }
+    {
+      IRBuilder<> KDB(KDef);
+      KDB.CreateStore(ConstantInt::get(I8, 0), Run);
+      KDB.CreateBr(Loop);
+    }
+  }
   {
     IRBuilder<> B(HUnr);
     B.CreateStore(ConstantInt::get(I8, 0), Run);
@@ -1905,6 +2293,15 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
       Value *V = irLoadBytes(B, I8, I64, Data, ConstantInt::get(I64, 0),
                              ConstantInt::get(I8, kPointerSize));
       B.CreateRet(B.CreateIntToPtr(V, RetTy));
+    } else if (RetTy->isFloatTy()) {
+      Value *V = irLoadBytes(B, I8, I64, Data, ConstantInt::get(I64, 0),
+                             ConstantInt::get(I8, 4));
+      Value *Bits = B.CreateTrunc(V, B.getInt32Ty());
+      B.CreateRet(B.CreateBitCast(Bits, RetTy));
+    } else if (RetTy->isDoubleTy()) {
+      Value *V = irLoadBytes(B, I8, I64, Data, ConstantInt::get(I64, 0),
+                             ConstantInt::get(I8, 8));
+      B.CreateRet(B.CreateBitCast(V, RetTy));
     } else {
       uint32_t Sz = V.typeSize(RetTy);
       Value *V = irLoadBytes(B, I8, I64, Data, ConstantInt::get(I64, 0),
@@ -1945,19 +2342,12 @@ static bool canVirtualize(Function &F, std::string &Why) {
         Why = "eh instruction unsupported";
         return false;
       }
-      if (I.getType()->isFloatingPointTy() ||
-          (I.getNumOperands() > 0 && I.getOperand(0)->getType()->isFloatingPointTy())) {
-        // Allow pure integer functions; reject when float values appear.
-        if (isa<FPMathOperator>(&I) || isa<FCmpInst>(&I) ||
-            I.getOpcode() == Instruction::FPToUI ||
-            I.getOpcode() == Instruction::FPToSI ||
-            I.getOpcode() == Instruction::UIToFP ||
-            I.getOpcode() == Instruction::SIToFP ||
-            I.getOpcode() == Instruction::FPTrunc ||
-            I.getOpcode() == Instruction::FPExt) {
-          Why = "floating-point IR unsupported (hard-fail skip)";
-          return false;
-        }
+      if (I.getType()->isFloatingPointTy() &&
+          I.getType()->isVectorTy()) {
+        // Scalar float ops are virtualized (OP_FBINOP/OP_FCMP/OP_FCAST);
+        // vector float still is not.
+        Why = "vector floating-point unsupported (hard-fail skip)";
+        return false;
       }
     }
   }
