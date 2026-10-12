@@ -165,6 +165,11 @@ bytecode plus a re-entrant interpreter that lives on the stack.
 - Memory: `alloca` / `load` / `store` (an alloca's result is a real VA, so
   pointers can be handed out)
 - Integers: binop / icmp (signed and unsigned) / cast / select
+- Scalar floats: fadd/fsub/fmul/fdiv, all 14 fcmp predicates (NaN semantics
+  preserved), fpext/fptrunc/sitofp/fptosi/fptoui/uitofp; `llvm.fmuladd`
+  expands to unfused fmul+fadd. Values ride i64 slots as IEEE bits
+- Atomics: integer `atomicrmw` (11 sub-ops, acq_rel), `cmpxchg`, and plain
+  atomic load/store (virtualized as plain ops + trailing acq_rel fence)
 - Control flow: `br` / `ret` / `unreachable`
 - `gep`: constant offsets, a single index, the common `[0, i]` array form
 - `call`: direct and indirect, leaving through `vmp_ch_*` handlers
@@ -180,11 +185,14 @@ bytecode plus a re-entrant interpreter that lives on the stack.
 
 **Explicitly unsupported (hard-fail skip)**
 
-- varargs, exceptions/EH, floating point, vectors, complex multi-dynamic-index
-  GEPs
+- varargs (including JNIEnv-style method calls), exceptions/EH, vector
+  floats (scalar floats are supported), complex multi-dynamic-index GEPs
 
-Target functions should be `-O0` / `optnone`. Acceptance test:
-`./samples/run_vmp.sh`.
+Target functions should be `-O0` / `optnone`. Acceptance tests:
+`./samples/run_vmp.sh` and `bash samples/test_obf_hardening.sh`
+(12 hardening gates: parity, multithreading, handler shuffling, atomic
+long-loop stress, float virtualization, dual-stream seed KDF, …).
+Builds and passes on LLVM 21 and LLVM 23.
 
 **Full documentation** (architecture / bytecode / switches / mixing with CFF /
 troubleshooting): [`docs/VMP.md`](docs/VMP.md).

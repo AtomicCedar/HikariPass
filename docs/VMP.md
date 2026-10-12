@@ -26,12 +26,18 @@
 ### 2.1 构建插件
 
 ```bash
-cmake -G Ninja -S . -B ./build-llvm22 \
+# LLVM 21 或 23 均可（两者都被 CI 验收；apt.llvm.org 安装）
+cmake -G Ninja -S . -B ./build-llvm21 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DLT_LLVM_INSTALL_DIR=/opt/homebrew/opt/llvm
-cmake --build ./build-llvm22
-# 产物：build-llvm22/obfuscation/libHikari.dylib  (或 .so)
+  -DLT_LLVM_INSTALL_DIR=/usr/lib/llvm-21
+cmake --build ./build-llvm21
+# 产物：build-llvm21/obfuscation/libHikari.so
 ```
+
+LLVM 23 兼容说明：`compat/CallSite.h` 的 DenseMapInfo 哨兵键与
+`StringEncryption.cpp` 的 `isNullValue` 已适配 23 的 API 变更；
+`BranchInst` 拆分（UncondBr/CondBr）与 `splitBasicBlock` Before 参数移除
+对本仓库无影响。
 
 ### 2.2 标注需要保护的函数
 
@@ -75,6 +81,9 @@ clang secret.o -o secret
 
 ```bash
 ./samples/run_vmp.sh          # 基础正确性（算术/分支/GEP/call/全局/递归）
+bash samples/test_obf_hardening.sh   # 12 项加固验收 gates（T1-T12:
+  # BB 名/seed 表多态/parity/多线程/varargs 跳过/JNI_OnLoad/handler 洗牌/
+  # 全局指针字符串/原子长循环/浮点虚拟化/双流 KDF）
 # 复杂样例源码：samples/c/vmp_complex.c
 # 复杂样例对比产物：samples/out/vc_vmp、samples/out/vc_vmp_cff
 ```
@@ -183,8 +192,9 @@ seed_reload(entry_ip)
 while running:
   op = fetch_op()          # code 层 XOR + opcode 层 XOR
   switch op:
-    ALLOCA / LOAD / STORE / BINOP / ICMP / BR / RET /
-    GEP / CALL / CAST / SELECT / UNREACHABLE
+    NOP / FENCE / ALLOCA / LOAD / STORE / BINOP / ICMP / BR / RET /
+    GEP / CALL / CAST / SELECT / UNREACHABLE / ATOMICRMW / CMPXCHG /
+    COPY / FBINOP / FCMP / FCAST
     default → trap (停机)
 BR 修改 ip 后 seed_reload(new_ip)
 RET 写返回值槽，running = 0
@@ -209,7 +219,19 @@ RET 写返回值槽，running = 0
 | `0x09` | `OP_CALL` | 出站调用（仅 `func_id`） |
 | `0x0A` | `OP_CAST` | trunc/zext/sext/… |
 | `0x0B` | `OP_SELECT` | 选择 |
+| `0x0C` | `OP_FENCE` | 原子 load/store 的尾随内存栅栏（acq_rel） |
+| `0x0D` | `OP_ATOMICRMW` | 原子读改写（11 种整数子操作） |
 | `0x0E` | `OP_UNREACHABLE` | 停机 |
+| `0x0F` | `OP_CMPXCHG` | 原子比较交换（两结果槽：old + i1） |
+| `0x10` | `OP_COPY` | cmpxchg 结果的槽间拷贝（extractvalue） |
+| `0x11` | `OP_FBINOP` | 浮点二元运算（fadd/fsub/fmul/fdiv） |
+| `0x12` | `OP_FCMP` | 浮点比较（LLVM 全部 14 个谓词） |
+| `0x13` | `OP_FCAST` | 浮点转换（fpext/fptrunc/sitofp/fptosi/fptoui/uitofp） |
+
+> **wire 值多态**：上表是 opcode 的**逻辑编号**（`vmp/Opcode.h` 常量）。字节码里出现的实际
+> wire 字节由 `initOpcodeMap` 按函数名 + `HIKARI_SEED` 派生的洗牌序列逐函数重映射
+> （`OP_NOP` 固定为 0），同一逻辑 opcode 在不同函数/不同 seed 下字节不同。
+> 解释器 dispatch 消费的是同一映射，且含假 `OP_NOP`（1/4 概率插在指令边界）。
 
 ### 5.2 PackedValue
 
@@ -232,6 +254,13 @@ BR 有条: op | 1 | cond_PV | target_t:u64 | target_f:u64
 RET:     op | has:u8 [| val_PV]
 GEP:     op | kind:u8 | elem_size:u64 | res_PV | base_PV | index_PV
 CALL:    op | func_id:u64          # 参数在 vmp_ch_* 内从 data 取
+FENCE:   op                                  # 单字节，无操作数
+ATOMICRMW: op | subop:u8 | res_PV(var) | ptr_PV | val_PV
+CMPXCHG:  op | sz:u8 | ptr_PV | cmp_PV | new_PV | res_off:u32 | flag_off:u32
+COPY:    op | res_PV(var) | src_off:u32      # cmpxchg 槽结果搬运
+FBINOP:  op | subop:u8 | res_PV | lhs_PV | rhs_PV   # sz4=float / sz8=double
+FCMP:    op | pred:u8 | res_PV | lhs_PV | rhs_PV    # pred = LLVM FCMP_* 1..14
+FCAST:   op | kind:u8 | res_PV | src_PV             # kind = 6 种转换
 ```
 
 `BR` 目标在 **加密前** 回填为 BB 入口 code 偏移。
@@ -248,6 +277,20 @@ CALL:    op | func_id:u64          # 参数在 vmp_ch_* 内从 data 取
 运行时：`get_byte` 解 code 层；`fetch_op` 再解 opcode 层。  
 跨 BB：`BR` 后 `vmp_seed_*` 按 `entry_ip` 查表重载两种 seed。
 
+### 5.5 Seed 掩码与 KDF（双流）
+
+`vmp_seeds_<fn>` 表里的明文 seed 用独立掩码流 XOR 保护：
+
+- **KDF**：`fnHashSeed` = 64-bit FNV-1a（函数名盐化域，如 `seeds|<fn>`）→ 两轮
+  SplitMix64 雪崩（黄金比例常数）→ xorshift32 白化；`HIKARI_SEED` 在输入端混入，
+  改 seed 即改变全部派生流（构建可复现）。
+- **双流混叠**：`mask(n) = A(n) ^ rotl(B(n), 7 ^ (n & 15))`。A/B 是两条独立
+  xorshift32 链，B 的种子来自第二个盐化域（`stream2|seeds|<fn>`）。单条流被逆向
+  不足以还原全部函数的 seed。
+- **两端一致**：编译期 emitter（`maskReplayA/B`）与运行时 `vmp_mask_<fn>` 逐位
+  相同，改任一侧必须同步另一侧。
+- 验收：`test_obf_hardening.sh` 的 T12（vmp_mask IR 必须含 ≥2 个不同流种子常量）。
+
 ---
 
 ## 6. 支持的 IR 与限制
@@ -256,6 +299,12 @@ CALL:    op | func_id:u64          # 参数在 vmp_ch_* 内从 data 取
 
 - `alloca`（非 VLA）、`load` / `store`（非 atomic/volatile）  
 - 整数 `i1/i8/i16/i32/i64` 的 binop / icmp / cast / select  
+- **标量浮点** `float`/`double` 的 binop / fcmp（全 14 谓词，NaN 语义保留）/
+  fpext / fptrunc / sitofp / fptosi / fptoui / uitofp；`llvm.fmuladd`/`fma`
+  展开为非融合 fmul+fadd。浮点值以 IEEE 位型存 i64 槽
+- **原子操作**：`atomicrmw` 的 11 种整数子操作（xchg/add/sub/and/or/xor/nand/
+  max/min/umax/umin，acq_rel）；`cmpxchg`（强/弱）；普通 atomic load/store
+  虚拟化为普通操作 + 尾随 `OP_FENCE`（acq_rel 保守升级）。volatile 原子拒绝
 - `br` / `ret` / `unreachable`  
 - `gep`：常量累积偏移、单索引、常见 `0, i` 数组形态  
 - `call`：直接 / 间接（经 `vmp_ch_*`）；debug/lifetime 等 intrinsic 丢弃  
@@ -267,9 +316,9 @@ CALL:    op | func_id:u64          # 参数在 vmp_ch_* 内从 data 取
 
 日志形如：`[VMP] skip foo (...)` 或 `[VMP] translate fail foo: ...`
 
-- 变参  
+- 变参（含 JNI 风格 JNIEnv 方法调用编译出的 varargs call site）  
 - 异常 / EH（`invoke`、landingpad 等）  
-- 浮点、向量  
+- **向量浮点**（vector float；标量浮点已支持）  
 - 复杂多动态索引 GEP  
 - 构建解释器失败时会尝试从 backup 恢复函数体  
 
@@ -394,12 +443,16 @@ llvm-dis /tmp/c_obf.bc -o /tmp/c_obf.ll   # 搜 vmp_loop / switchVar
 **已具备**
 
 - 整数 IR 子集虚拟化、出站 call、常见 GEP、全局指针  
-- L1 双 seed 加密、栈上可重入、与 CFF 混合  
-- 失败 skip / restore、验收脚本  
+- **标量浮点**（binop/fcmp/fp-cast）与**原子操作**（atomicrmw/cmpxchg/fence）虚拟化  
+- L1 双 seed 加密、SplitMix64+双流 seed 掩码 KDF、逐函数 opcode 多态、
+  handler 洗牌、假 NOP 指令、IP 越界保护、handler 栈泄漏修复  
+- 失败 skip / restore、验收脚本（`test_obf_hardening.sh` 12 项 gates）  
+- LLVM 21 与 LLVM 23 双版本构建验证（LLVM 23: DenseMapInfo<CallSite> 哨兵、
+  Constant::isZeroValue 移除两处兼容）
 
 **未做 / 非目标（当前）**
 
-- 浮点 / 变参 / EH / 完整 IR  
+- 向量浮点 / 变参 / EH / 完整 IR  
 - 商业级 opcode 空间膨胀、多解释器克隆、运行时自修改  
 - Android 自定义 Linker / SO 抽取壳  
 - 按 BB 拆多段小 VM（降低「大块 bytecode」观感的进一步方案）  
