@@ -131,17 +131,20 @@ that is what makes an older clang able to feed an LLVM 22 plugin.
 | `enable-strcry` | string encryption (C strings / Rust string data) |
 | `enable-constenc` | constant encryption |
 | `enable-indibran` | indirect branches |
+| `enable-fco` | function-call obfuscation (`dlopen`/`dlsym` style) |
+| `enable-funcwra` | function wrapping (known unstable) |
 | `enable-antihook` | AntiHook (AArch64 inline / antirebind) |
 | `enable-adb` | AntiDebugging |
 | `enable-vmp` | **IR virtualization (VMP)**: translate functions into a private bytecode plus an interpreter |
 
-`enable-allobf` turns on: `bcf`, `cff`, `sub`, `split`, `strcry`, `indibran`.
+`enable-allobf` turns on: `bcf`, `cff`, `sub`, `split`, `strcry`, `indibran`,
+`fco`, `funcwra`.
 It does **not** turn on: `constenc`, `antihook`, `adb`, `vmp` — ask for those
 explicitly.
 
 Environment variables work as an alternative to the `hikari()` arguments:
-`BCFOBF`, `CFFOBF`, `SUBOBF`, `SPLITOBF`, `STRCRY`, `INDIBRAN`,
-`ANTIHOOK`, `ADB`, `CONSTENC`, `ALLOBF`, `VMP`.
+`BCFOBF`, `CFFOBF`, `SUBOBF`, `SPLITOBF`, `STRCRY`, `INDIBRAN`, `FCO`,
+`FUNCWRA`, `ANTIHOOK`, `ADB`, `CONSTENC`, `ALLOBF`, `VMP`.
 
 ### VMP (`enable-vmp`)
 
@@ -222,11 +225,8 @@ See [`samples/README.md`](samples/README.md).
    share the LLVM major version.
 2. `enable-strcry` can still be unstable on some Rust code; turn strcry off or
    lower the optimization level if it misbehaves.
-3. The former `enable-fco` (dlsym-style call obfuscation) and
-   `enable-funcwra` (function wrapping, historically broken) passes were
-   **removed**: fco's runtime symbol resolution breaks under custom
-   in-memory loaders (Android inject-style) and funcwra never left the
-   broken state.
+3. `enable-funcwra` is historically marked Broken and should not be enabled by
+   default.
 4. Control-flow passes (especially `indibran` + `bcf`) noticeably increase
    binary size and compile time.
 

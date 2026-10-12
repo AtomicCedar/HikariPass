@@ -7,6 +7,8 @@
 #include "include/ConstantEncryption.h"
 #include "include/CryptoUtils.h"
 #include "include/Flattening.h"
+#include "include/FunctionCallObfuscate.h"
+#include "include/FunctionWrapper.h"
 #include "include/IndirectBranch.h"
 #include "include/Split.h"
 #include "include/StringEncryption.h"

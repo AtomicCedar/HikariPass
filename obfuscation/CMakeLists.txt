@@ -1,4 +1,5 @@
 add_library(Hikari SHARED
+        FunctionCallObfuscate.cpp
         CryptoUtils.cpp
         BogusControlFlow.cpp
         SubstituteImpl.cpp
@@ -11,6 +12,7 @@ add_library(Hikari SHARED
         AntiHooking.cpp
         StringEncryption.cpp
         IndirectBranch.cpp
+        FunctionWrapper.cpp
         ConstantEncryption.cpp
         Virtualization.cpp
         Obfuscation.cpp

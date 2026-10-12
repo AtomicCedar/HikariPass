@@ -333,12 +333,12 @@ FCAST:   op | kind:u8 | res_PV | src_PV             # kind = 6 种转换
 ## 7. 与其它 Hikari Pass 的顺序
 
 ```
-AntiHook → AntiDebug → StringEnc
+AntiHook → FCO → AntiDebug → StringEnc
   → Split → BCF
   → CFF（跳过即将 VMP 的函数）
   → SUB
   → ★ VMP（+ 可选 post-CFF）★
-  → ConstEnc → IndiBr
+  → ConstEnc → IndiBr → FuncWrapper
 ```
 
 | 组合 | 建议 |
