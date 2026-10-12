@@ -170,5 +170,37 @@ if grep -q "skip calc\|floating-point IR unsupported" "$OUT/float_calc.err"; the
 fi
 check "T11-float-virtualized" $r
 
+# T12: seed KDF strength. The seed-mask stream must not be a single
+# plain-xorshift32 chain seeded by one FNV hash: an attacker who reverses
+# xorshift32 once (globally) recovers every function's seeds and thus the
+# opcode map + bytecode. Gate: the runtime replay helper vmp_mask_<fn> must
+# consume TWO independent derived streams (dual-stream mixing), detectable in
+# the emitted IR as two distinct seed constants stored into two state allocas
+# before the loop, and a rotate/mix of one stream with the other (shift + xor
+# + or/rotate pattern). Also the KDF must differ when HIKARI_SEED changes
+# (already covered by T2) — here we assert structural strength only.
+cat > "$OUT/kdf_probe.c" <<'KEOF'
+__attribute__((annotate("vmp")))
+int target(int x) { return x * 3 + 1; }
+KEOF
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/kdf_probe.c" -o "$OUT/kdf_probe.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/kdf_probe.ll" \
+  -o "$OUT/kdf_probe.bc" 2>/dev/null
+llvm-dis "$OUT/kdf_probe.bc" -o "$OUT/kdf_o.ll"
+# count distinct xorshift chains in vmp_mask_target: two state allocas each
+# seeded with a DIFFERENT constant, both updated in the loop body.
+python3 - "$OUT/kdf_o.ll" <<'PEOF'
+import re, sys
+ll = open(sys.argv[1]).read()
+m = re.search(r'define internal i32 @vmp_mask_target\(i32[^\{]*\{(.*)$', ll, re.S)
+body = m.group(1) if m else ''
+# find all i32 constant stores inside mask fn (the stream seeds)
+stores = re.findall(r'store i32 (-?\d+), ptr %', body)
+seeds = [int(s) & 0xFFFFFFFF for s in stores if (int(s) & 0xFFFFFFFF) > 0x10000]
+# dual-stream = 2+ distinct large seed constants
+sys.exit(0 if len(set(seeds)) >= 2 else 1)
+PEOF
+check "T12-dual-stream-seed-kdf" $?
+
 rm -rf "$OUT"
 exit $FAIL

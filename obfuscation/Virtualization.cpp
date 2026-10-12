@@ -104,33 +104,55 @@ static void emitPackedVar(std::vector<uint8_t> &C, uint8_t Size, uint64_t Off) {
 // Deterministic per-function PRNG: derives a stream from the function name so
 // opcode mappings / fake-instruction placement stay stable under HIKARI_SEED.
 static uint32_t fnHashSeed(StringRef Name) {
-  uint32_t H = 0x811C9DC5u; // FNV-1a
+  // SplitMix64-strengthened KDF: FNV-1a over the name gives the 64-bit input,
+  // two SplitMix64 rounds with golden-ratio constants avalanche all bits, then
+  // a final xorshift white-out.  A single hash inversion no longer maps a
+  // known name to the raw stream state, and HIKARI_SEED keeps replayability.
+  uint64_t H = 0xCBF29CE484222325ull; // FNV-1a 64-bit offset basis
   for (char Ch : Name) {
     H ^= static_cast<uint8_t>(Ch);
-    H *= 0x01000193u;
+    H *= 0x100000001B3ull;
   }
-  // Mix in the global seed so HIKARI_SEED changes every derived stream.
-  uint32_t G = 0;
   if (const char *E = getenv("HIKARI_SEED"))
-    G = static_cast<uint32_t>(strtoull(E, nullptr, 0));
-  G ^= H;
+    H ^= static_cast<uint64_t>(strtoull(E, nullptr, 0)) * 0x9E3779B97F4A7C15ull;
+  H = (H ^ (H >> 30)) * 0xBF58476D1CE4E5B9ull;
+  H = (H ^ (H >> 27)) * 0x94D049BB133111EBull;
+  H ^= H >> 31;
+  uint32_t G = static_cast<uint32_t>(H ^ (H >> 32));
   G ^= G >> 16;
   G *= 0x7FEB4CE6u;
   G ^= G >> 15;
   return G ? G : 0x9E3779B9u;
 }
 
+// Second independent stream seed: same KDF, salted domain so the two mask
+// streams never share state even for identical names.
+static uint32_t fnHashSeed2(StringRef Name) {
+  return fnHashSeed((Twine("stream2|") + Name).str());
+}
+
 static uint32_t fnNext(uint32_t *State) { return xorshift32(State); }
 
-// Runtime-encodable mask replay: mask(n) = the (n+1)-th draw of the stream
-// seeded by Seed0.  The compiler-side emitter uses the same function so the
-// constants in vmp_seeds_ match what SeedReloadFn recovers.
-static uint32_t maskReplay(uint32_t Seed0, uint32_t N) {
-  uint32_t S = Seed0;
-  uint32_t V = 0;
-  for (uint32_t I = 0; I <= N; ++I)
-    V = fnNext(&S);
+// Dual-stream mask replay: mask(n) = A(n) ^ rol32(B(n), 7 ^ (n & 0xF)).
+// A and B are independent xorshift32 chains; mixing B through a data-dependent
+// rotate makes single-stream inversion (one break recovers all functions)
+// insufficient.  maskReplayA/B give the per-stream value at draw n; the
+// runtime vmp_mask_<fn> emits the identical structure.
+static uint32_t rotl32(uint32_t V, unsigned R) {
+  return (V << (R & 31)) | (V >> ((32 - (R & 31)) & 31));
+}
+static uint32_t maskReplayA(uint32_t SeedA, uint32_t N) {
+  uint32_t S = SeedA, V = 0;
+  for (uint32_t I = 0; I <= N; ++I) V = fnNext(&S);
   return V;
+}
+static uint32_t maskReplayB(uint32_t SeedB, uint32_t N) {
+  uint32_t S = SeedB, V = 0;
+  for (uint32_t I = 0; I <= N; ++I) V = fnNext(&S);
+  return rotl32(V, 7u ^ (N & 0xFu));
+}
+static uint32_t maskReplay(uint32_t SeedA, uint32_t SeedB, uint32_t N) {
+  return maskReplayA(SeedA, N) ^ maskReplayB(SeedB, N);
 }
 
 // ---- translate context ------------------------------------------------------
@@ -1412,14 +1434,17 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   StructType *SeedTy = StructType::get(Ctx, {I32, I32, I32});
   unsigned NSeeds = std::max<size_t>(V.BBSeeds.size(), 1);
   ArrayType *SeedArrTy = ArrayType::get(SeedTy, NSeeds);
-  // Mask stream derived from the host function name (independent of seeds).
-  // mask(n) = (n+1)-th draw; runtime vmp_mask_<fn> replays identically.
+  // Dual-stream masks derived from the host function name (independent of
+  // seeds).  mask(n) = A(n) ^ rotl(B(n), 7^(n&15)); runtime vmp_mask_<fn>
+  // replays the identical structure.
   uint32_t SeedMask0 = fnHashSeed((Twine("seeds|") + Host->getName()).str());
+  uint32_t SeedMaskB0 =
+      fnHashSeed2((Twine("seeds|") + Host->getName()).str());
   auto seedMaskAt = [&](unsigned Idx, unsigned Field) -> uint32_t {
     // field 0 = entry ip stays plaintext (the reload matches on it).
     if (Field == 0)
       return 0;
-    return maskReplay(SeedMask0, Idx * 2u + (Field - 1));
+    return maskReplay(SeedMask0, SeedMaskB0, Idx * 2u + (Field - 1));
   };
   SmallVector<Constant *, 8> SeedElts;
   for (unsigned SI = 0; SI < NSeeds; ++SI) {
@@ -1449,11 +1474,18 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     BasicBlock *MB = BasicBlock::Create(Ctx, "", MaskFn);
     IRBuilder<> MBld(MB);
-    // PRNG state, seeded with the same constant the emitter used.
+    // Dual-stream PRNG state, seeded with the same constants the emitter
+    // used.  mask(n) = A(n) ^ rotl(B(n), 7 ^ (n & 15)).
     AllocaInst *StA = MBld.CreateAlloca(I32);
     MBld.CreateStore(ConstantInt::get(I32, SeedMask0), StA);
+    AllocaInst *StB = MBld.CreateAlloca(I32);
+    MBld.CreateStore(ConstantInt::get(I32, SeedMaskB0), StB);
     AllocaInst *NA = MBld.CreateAlloca(I32);
     MBld.CreateStore(&*MaskFn->arg_begin(), NA);
+    // Original n (NA is decremented to 0 by the loop; the rotate amount needs
+    // the original parameter).
+    AllocaInst *NOrig = MBld.CreateAlloca(I32);
+    MBld.CreateStore(&*MaskFn->arg_begin(), NOrig);
     auto *MLoop = BasicBlock::Create(Ctx, "", MaskFn);
     auto *MBody = BasicBlock::Create(Ctx, "", MaskFn);
     auto *MDone = BasicBlock::Create(Ctx, "", MaskFn);
@@ -1461,30 +1493,45 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     IRBuilder<> ML(MLoop);
     Value *N = ML.CreateLoad(I32, NA);
     ML.CreateCondBr(ML.CreateICmpSGT(N, ConstantInt::get(I32, 0)), MBody, MDone);
+    // One loop body draws BOTH streams once: after the loop each state holds
+    // its n-th draw (draw 0 happens on n=1's first visit — matching the
+    // emitter, which draws n+1 times for mask(n)).
     IRBuilder<> MBd(MBody);
     MBd.CreateStore(MBd.CreateSub(MBd.CreateLoad(I32, NA),
                                   ConstantInt::get(I32, 1)),
                     NA);
-    Value *X = MBd.CreateLoad(I32, StA);
-    X = MBd.CreateSelect(MBd.CreateICmpEQ(X, ConstantInt::get(I32, 0)),
+    auto xorshiftBlock = [&I32](IRBuilder<> &B, Value *X) -> Value * {
+      X = B.CreateSelect(B.CreateICmpEQ(X, ConstantInt::get(I32, 0)),
                          ConstantInt::get(I32, 0xA5A5A5A5u), X);
-    X = MBd.CreateXor(X, MBd.CreateShl(X, ConstantInt::get(I32, 13)));
-    X = MBd.CreateXor(X, MBd.CreateLShr(X, ConstantInt::get(I32, 17)));
-    X = MBd.CreateXor(X, MBd.CreateShl(X, ConstantInt::get(I32, 5)));
-    MBd.CreateStore(X, StA);
+      X = B.CreateXor(X, B.CreateShl(X, ConstantInt::get(I32, 13)));
+      X = B.CreateXor(X, B.CreateLShr(X, ConstantInt::get(I32, 17)));
+      X = B.CreateXor(X, B.CreateShl(X, ConstantInt::get(I32, 5)));
+      return X;
+    };
+    Value *XA = MBd.CreateLoad(I32, StA);
+    XA = xorshiftBlock(MBd, XA);
+    MBd.CreateStore(XA, StA);
+    Value *XB = MBd.CreateLoad(I32, StB);
+    XB = xorshiftBlock(MBd, XB);
+    MBd.CreateStore(XB, StB);
     MBd.CreateBr(MLoop);
     IRBuilder<> MD(MDone);
     // The loop above drew n times; mask(n) needs n+1 draws total.
-    {
-      Value *X = MD.CreateLoad(I32, StA);
-      X = MD.CreateSelect(MD.CreateICmpEQ(X, ConstantInt::get(I32, 0)),
-                          ConstantInt::get(I32, 0xA5A5A5A5u), X);
-      X = MD.CreateXor(X, MD.CreateShl(X, ConstantInt::get(I32, 13)));
-      X = MD.CreateXor(X, MD.CreateLShr(X, ConstantInt::get(I32, 17)));
-      X = MD.CreateXor(X, MD.CreateShl(X, ConstantInt::get(I32, 5)));
-      MD.CreateStore(X, StA);
-    }
-    MD.CreateRet(MD.CreateLoad(I32, StA));
+    Value *XA2 = MD.CreateLoad(I32, StA);
+    XA2 = xorshiftBlock(MD, XA2);
+    Value *XB2 = MD.CreateLoad(I32, StB);
+    XB2 = xorshiftBlock(MD, XB2);
+    // rotl(B, 7 ^ (n & 15)) via shl|shr pair; Rot is 0..15 so both shifts are
+    // < 32 after urem-guarding the shr amount (Rot==0 degenerates correctly:
+    // (B<<0)|(B>>0) = B).
+    Value *Rot = MD.CreateAnd(
+        MD.CreateXor(ConstantInt::get(I32, 7), MD.CreateLoad(I32, NOrig)),
+        ConstantInt::get(I32, 15));
+    Value *Shl = MD.CreateShl(XB2, Rot);
+    Value *Shr = MD.CreateLShr(
+        XB2, MD.CreateURem(MD.CreateSub(ConstantInt::get(I32, 32), Rot),
+                           ConstantInt::get(I32, 32)));
+    MD.CreateRet(MD.CreateXor(XA2, MD.CreateOr(Shl, Shr)));
   }
 
   FunctionType *SRTy =
