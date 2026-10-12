@@ -1,0 +1,19 @@
+# ninja log v5
+0	1202	1791829614521359842	obfuscation/CMakeFiles/Hikari.dir/CryptoUtils.cpp.o	5fbe74a78e6dcc8e
+1203	3669	1791829616988348967	obfuscation/CMakeFiles/Hikari.dir/SubstituteImpl.cpp.o	ee533a8e5e620ab0
+1	5354	1791829618673341539	obfuscation/CMakeFiles/Hikari.dir/BogusControlFlow.cpp.o	85f85136424b67d7
+3670	5465	1791829618785341045	obfuscation/CMakeFiles/Hikari.dir/Substitution.cpp.o	3eb03c0484422b59
+4	2798	1791829661114150538	obfuscation/CMakeFiles/Hikari.dir/Flattening.cpp.o	e2d50997b13bd9d2
+5	3136	1791829661451149021	obfuscation/CMakeFiles/Hikari.dir/LegacyLowerSwitch.cpp.o	aab7e6966df3b478
+3136	5675	1791829663992137584	obfuscation/CMakeFiles/Hikari.dir/SplitBasicBlocks.cpp.o	cac5f56fe5fc9530
+2798	6262	1791829664580134937	obfuscation/CMakeFiles/Hikari.dir/Utils.cpp.o	2a943694a1b6f6fd
+2	4066	1791829668655116595	obfuscation/CMakeFiles/Hikari.dir/AntiDebugging.cpp.o	609554670e22c878
+2	4228	1791829799176532414	obfuscation/CMakeFiles/Hikari.dir/AntiHooking.cpp.o	1a89ad7bbaaa06d
+2	5794	1791829800742525673	obfuscation/CMakeFiles/Hikari.dir/FunctionCallObfuscate.cpp.o	67e7027e9d87d169
+3	3442	1791829829103399195	obfuscation/CMakeFiles/Hikari.dir/FunctionWrapper.cpp.o	79c80469b3a055a0
+2	4679	1791829830340393552	obfuscation/CMakeFiles/Hikari.dir/IndirectBranch.cpp.o	d73d3f94dc82f84e
+2	5796	1791829831456388462	obfuscation/CMakeFiles/Hikari.dir/StringEncryption.cpp.o	be8da2c1aa0f1a87
+3442	8378	1791829834039376679	obfuscation/CMakeFiles/Hikari.dir/ConstantEncryption.cpp.o	46f8c36ffffa4cc8
+5796	11528	1791829837189362311	obfuscation/CMakeFiles/Hikari.dir/Obfuscation.cpp.o	3ce6408fd9b54ef9
+4679	13726	1791829839386352290	obfuscation/CMakeFiles/Hikari.dir/Virtualization.cpp.o	19829b681980d624
+13726	14321	1791829839980349580	obfuscation/libHikari.so	81c2b2dc8d2e7411

@@ -267,8 +267,9 @@ struct StringEncryption : public ModulePass {
         }
       }
     for (GlobalVariable *GV : rawStrings) {
-      if (GV->getInitializer()->isZeroValue() ||
-          GV->getInitializer()->isNullValue())
+      // Constant::isZeroValue was removed in LLVM 23; isNullValue covers the
+      // zero/null initializer cases this check guarded against.
+      if (GV->getInitializer()->isNullValue())
         continue;
       auto globalIt = globalOld2New.find(GV);
       if (globalIt != globalOld2New.end()) {

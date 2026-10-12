@@ -698,22 +698,27 @@ public:
 };
 
 template <> struct DenseMapInfo<CallSite> {
-  using BaseInfo = DenseMapInfo<decltype(CallSite::I)>;
-
+  // LLVM 23 removed getEmptyKey/getTombstoneKey from the PointerIntPair
+  // DenseMapInfo specialization, so the sentinel keys are built locally:
+  // an empty CallSite (null I) is the empty key; a tombstone marks the I
+  // pointer's low bit (alignment keeps it free for real instructions).
   static CallSite getEmptyKey() {
     CallSite CS;
-    CS.I = BaseInfo::getEmptyKey();
+    CS.I = decltype(CallSite::I)::getFromOpaqueValue(
+        static_cast<void *>(nullptr));
     return CS;
   }
 
   static CallSite getTombstoneKey() {
     CallSite CS;
-    CS.I = BaseInfo::getTombstoneKey();
+    CS.I = decltype(CallSite::I)::getFromOpaqueValue(
+        reinterpret_cast<void *>(static_cast<uintptr_t>(1)));
     return CS;
   }
 
   static unsigned getHashValue(const CallSite &CS) {
-    return BaseInfo::getHashValue(CS.I);
+    uintptr_t IV = reinterpret_cast<uintptr_t>(CS.I.getOpaqueValue());
+    return unsigned(IV) ^ unsigned(IV >> 9);
   }
 
   static bool isEqual(const CallSite &LHS, const CallSite &RHS) {
