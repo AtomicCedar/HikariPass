@@ -47,9 +47,6 @@ static cl::opt<bool>
 static cl::opt<bool> EnableAllObfuscation("enable-allobf", cl::init(false),
                                           cl::NotHidden,
                                           cl::desc("Enable All Obfuscation."));
-static cl::opt<bool> EnableFunctionCallObfuscate(
-    "enable-fco", cl::init(false), cl::NotHidden,
-    cl::desc("Enable Function CallSite Obfuscation."));
 static cl::opt<bool>
     EnableStringEncryption("enable-strcry", cl::init(false), cl::NotHidden,
                            cl::desc("Enable String Encryption."));
@@ -59,9 +56,6 @@ static cl::opt<bool>
 static cl::opt<bool>
     EnableIndirectBranching("enable-indibran", cl::init(false), cl::NotHidden,
                             cl::desc("Enable Indirect Branching."));
-static cl::opt<bool>
-    EnableFunctionWrapper("enable-funcwra", cl::init(false), cl::NotHidden,
-                          cl::desc("Enable Function Wrapper."));
 static cl::opt<bool>
     EnableVirtualization("enable-vmp", cl::init(false), cl::NotHidden,
                          cl::desc("Enable IR Virtualization (VMP)."));
@@ -77,17 +71,11 @@ static void LoadEnv(void) {
   if (getenv("ALLOBF")) {
     EnableAllObfuscation = true;
   }
-  if (getenv("FCO")) {
-    EnableFunctionCallObfuscate = true;
-  }
   if (getenv("STRCRY")) {
     EnableStringEncryption = true;
   }
   if (getenv("INDIBRAN")) {
     EnableIndirectBranching = true;
-  }
-  if (getenv("FUNCWRA")) {
-    EnableFunctionWrapper = true; // Broken
   }
   if (getenv("BCFOBF")) {
     EnableBogusControlFlow = true;
@@ -133,13 +121,6 @@ struct Obfuscation : public ModulePass {
     MP->doInitialization(M);
     MP->runOnModule(M);
     delete MP;
-    // Now do FCO
-    FunctionPass *FP = createFunctionCallObfuscatePass(
-        EnableAllObfuscation || EnableFunctionCallObfuscate);
-    for (Function &F : M)
-      if (!F.isDeclaration())
-        FP->runOnFunction(F);
-    delete FP;
     MP = createAntiDebuggingPass(EnableAntiDebugging);
     MP->runOnModule(M);
     delete MP;
@@ -196,10 +177,6 @@ struct Obfuscation : public ModulePass {
       if (!F.isDeclaration())
         P->runOnFunction(F);
     delete P;
-    MP = createFunctionWrapperPass(EnableAllObfuscation ||
-                                   EnableFunctionWrapper);
-    MP->runOnModule(M);
-    delete MP;
     // Cleanup Flags
     SmallVector<Function *, 8> toDelete;
     for (Function &F : M)
@@ -250,7 +227,6 @@ char Obfuscation::ID = 0;
 INITIALIZE_PASS_BEGIN(Obfuscation, "obfus", "Enable Obfuscation", false, false)
 INITIALIZE_PASS_DEPENDENCY(BogusControlFlow);
 INITIALIZE_PASS_DEPENDENCY(Flattening);
-INITIALIZE_PASS_DEPENDENCY(FunctionCallObfuscate);
 INITIALIZE_PASS_DEPENDENCY(IndirectBranch);
 INITIALIZE_PASS_DEPENDENCY(SplitBasicBlock);
 INITIALIZE_PASS_DEPENDENCY(StringEncryption);
@@ -285,17 +261,12 @@ PassPluginLibraryInfo getHikariPluginInfo() {
                     EnableSubstitution = true;
                   } else if (Element.Name == EnableAllObfuscation.ArgStr) {
                     EnableAllObfuscation = true;
-                  } else if (Element.Name ==
-                             EnableFunctionCallObfuscate.ArgStr) {
-                    EnableFunctionCallObfuscate = true;
                   } else if (Element.Name == EnableStringEncryption.ArgStr) {
                     EnableStringEncryption = true;
                   } else if (Element.Name == EnableConstantEncryption.ArgStr) {
                     EnableConstantEncryption = true;
                   } else if (Element.Name == EnableIndirectBranching.ArgStr) {
                     EnableIndirectBranching = true;
-                  } else if (Element.Name == EnableFunctionWrapper.ArgStr) {
-                    EnableFunctionWrapper = true;
                   } else if (Element.Name == EnableVirtualization.ArgStr) {
                     EnableVirtualization = true;
                   }
