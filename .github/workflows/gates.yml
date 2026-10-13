@@ -1,0 +1,34 @@
+name: hardening-gates
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  gates:
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm: [21, 23]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM ${{ matrix.llvm }}
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/noble/ llvm-toolchain-noble-${{ matrix.llvm }} main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y clang-${{ matrix.llvm }} llvm-${{ matrix.llvm }} lld-${{ matrix.llvm }} ninja-build ripgrep
+      - name: Configure
+        run: cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DLT_LLVM_INSTALL_DIR=/usr/lib/llvm-${{ matrix.llvm }}
+      - name: Build plugin
+        run: cmake --build build
+      - name: Hardening gates (T1-T18)
+        run: |
+          PLUGIN=build/obfuscation/libHikari.so LLVM_BIN=/usr/lib/llvm-${{ matrix.llvm }}/bin \
+            bash samples/test_obf_hardening.sh
+      - name: run_vmp smoke
+        run: |
+          PLUGIN=build/obfuscation/libHikari.so LLVM_BIN=/usr/lib/llvm-${{ matrix.llvm }}/bin \
+            bash samples/run_vmp.sh
