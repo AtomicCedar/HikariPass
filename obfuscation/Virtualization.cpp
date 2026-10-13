@@ -1339,17 +1339,24 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   // alloca in a non-entry block to a DYNAMIC stack adjustment that is never
   // popped, so every pass through a handler would permanently eat stack —
   // a long-running virtualized loop (e.g. 10k atomic RMW iterations) then
-  // walks 8MB down and dies on the guard page.  Entry-block allocas are
-  // hoisted into the frame once; reuse across handler invocations is safe
-  // because each handler writes its scratch before reading it and the VM
-  // never re-enters a handler mid-use (per-invocation VM state).
-  IRBuilder<> AB0(Entry);
-  auto *SzT8 = AB0.CreateAlloca(I8, nullptr, "hscratch8");
-  auto *SzT32 = AB0.CreateAlloca(I32, nullptr, "hscratch32");
-  auto *SzT64 = AB0.CreateAlloca(I64, nullptr, "hscratch64");
-  auto entryAlloca8 = [&]() { return SzT8; };
-  auto entryAlloca32 = [&]() { return SzT32; };
-  auto entryAlloca64 = [&]() { return SzT64; };
+  // walks 8MB down and dies on the guard page.
+  //
+  // Each call allocates a FRESH entry-block alloca (they all end up in the
+  // entry frame, so the stack-leak fix still holds).  A single shared
+  // hscratch per width is WRONG: lifetimes overlap across callEval/callReadVar
+  // (e.g. HStore keeps Size live in hscratch8 across callEval, which writes
+  // its own size out through the same cell), corrupting handler state
+  // nondeterministically (CI smoke sweep: seed sweep SIGSEGV in arr_sum,
+  // wild pointer built from an overwritten size byte).
+  static unsigned HSCounter = 0;
+  auto freshAlloca = [&](Type *Ty, const char *Prefix) -> AllocaInst * {
+    IRBuilder<> AB0(&Entry->front());
+    return AB0.CreateAlloca(Ty, nullptr,
+                            (Twine(Prefix) + Twine(HSCounter++)).str());
+  };
+  auto entryAlloca8 = [&]() { return freshAlloca(I8, "hs8_"); };
+  auto entryAlloca32 = [&]() { return freshAlloca(I32, "hs32_"); };
+  auto entryAlloca64 = [&]() { return freshAlloca(I64, "hs64_"); };
 
   auto *HAlloca = BasicBlock::Create(Ctx, "", VMF);
   auto *HLoad = BasicBlock::Create(Ctx, "", VMF);
