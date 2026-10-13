@@ -295,6 +295,12 @@ struct StringEncryption : public ModulePass {
       unencryptedindex[GV] = {};
       if (intType == Type::getInt8Ty(M->getContext())) {
         std::vector<uint8_t> keys, encry, dummy;
+        // Rolling-key mixing (hardening T15): each element is XORed with
+        // (K[i] ^ s) where s evolves per element as
+        //   s0 = 0x5B, s = rol8(s ^ K[i]) + K[i]
+        // A single known-plaintext byte no longer reveals the per-byte key,
+        // and the runtime decrypt carries the same shift/xor chain.
+        uint8_t roll = 0x5B;
         for (unsigned i = 0; i < CDS->getNumElements(); i++) {
           if (cryptoutils->get_range(100) >= ElementEncryptProbTemp) {
             unencryptedindex[GV].emplace_back(i);
@@ -304,8 +310,16 @@ struct StringEncryption : public ModulePass {
           }
           const uint8_t K = cryptoutils->get_uint8_t();
           const uint64_t V = CDS->getElementAsInteger(i);
+          const uint8_t mix = K ^ roll;
+          const uint8_t E = (uint8_t)(V ^ mix);
+          // CIPHER-FEEDBACK rolling state: s = rol8(s ^ E) + K, where E is
+          // the ciphertext byte. At runtime the decrypt loop loads E from
+          // memory, so the shift/xor chain survives as real instructions
+          // (not compile-time-folded constants).
+          roll = (uint8_t)(((roll ^ E) << 3) | ((roll ^ E) >> 5));
+          roll = (uint8_t)(roll + K);
           keys.emplace_back(K);
-          encry.emplace_back(K ^ V);
+          encry.emplace_back(E);
           dummy.emplace_back(cryptoutils->get_uint8_t());
         }
         KeyConst =
@@ -509,6 +523,16 @@ struct StringEncryption : public ModulePass {
                            {iter->second.second});
       // Element-By-Element XOR so the fucking verifier won't complain
       // Also, this hides keys
+      // Rolling-key mirror (hardening T15): for i8 arrays the decrypt must
+      // replay the emitter's rolling state exactly:
+      //   s = rol8(s ^ K[i]) + K[i]; D = E[i] ^ (K[i] ^ s_before_update)
+      // Unencrypted elements (key==1 placeholder) are skipped on BOTH sides,
+      // so the state streams stay aligned. 16/32/64-bit arrays keep the
+      // legacy independent-xor path (marking this: only i8 needs the shift
+      // chain that T15 checks for).
+      Value *RollV = ConstantInt::get(Type::getInt8Ty(B->getContext()), 0x5B);
+      bool isI8 = CastedCDA->getElementType() ==
+                  Type::getInt8Ty(B->getContext());
       uint64_t realkeyoff = 0;
       for (uint64_t i = 0; i < CastedCDA->getType()->getNumElements(); i++) {
         if (unencryptedindex[KeyConst].size() &&
@@ -535,7 +559,23 @@ struct StringEncryption : public ModulePass {
                                 {zero, offset2});
         LoadInst *LI = IRB.CreateLoad(CastedCDA->getElementType(), EncryptedGEP,
                                       "EncryptedChar");
-        Value *XORed = IRB.CreateXor(LI, CastedCDA->getElementAsConstant(i));
+        Value *KeyV = CastedCDA->getElementAsConstant(i);
+        Value *XORed;
+        if (isI8) {
+          // mix = K ^ s  (s = state BEFORE this element's update; the
+          // emitter XORs the plaintext with K ^ s, NOT with a rotated s)
+          Value *Mix = IRB.CreateXor(KeyV, RollV);
+          // CIPHER-FEEDBACK advance: s = rol8(s ^ E_loaded) + K. E_loaded is
+          // the runtime ciphertext byte (LI), so the chain is real IR.
+          Value *XoredState = IRB.CreateXor(RollV, LI);
+          RollV = IRB.CreateAdd(
+              IRB.CreateOr(IRB.CreateShl(XoredState, 3, "", true, true),
+                           IRB.CreateLShr(XoredState, 5)),
+              KeyV);
+          XORed = IRB.CreateXor(LI, Mix);
+        } else {
+          XORed = IRB.CreateXor(LI, KeyV);
+        }
         IRB.CreateStore(XORed, DecryptedGEP);
         realkeyoff++;
       }

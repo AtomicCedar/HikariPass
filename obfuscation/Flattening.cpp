@@ -95,7 +95,7 @@ void Flattening::flatten(Function *f) {
       --i;
     }
 
-    BasicBlock *tmpBB = insert->splitBasicBlock(i, "first");
+    BasicBlock *tmpBB = insert->splitBasicBlock(i, "");
     origBB.insert(origBB.begin(), tmpBB);
   }
 
@@ -103,8 +103,10 @@ void Flattening::flatten(Function *f) {
   Instruction *oldTerm = insert->getTerminator();
 
   // Create switch variable and set as it
+  // (hardening: no textual name on the state alloca/load/BBs — the named
+  // "%switchVar"/"loopEntry" trio is the textbook deflattener signature)
   switchVar = new AllocaInst(Type::getInt32Ty(f->getContext()),
-                             DL.getAllocaAddrSpace(), "switchVar",
+                             DL.getAllocaAddrSpace(), "",
                              BasicBlock::iterator(oldTerm));
   switchVarAddr =
       new AllocaInst(PointerType::get(f->getContext(), 0),
@@ -120,10 +122,10 @@ void Flattening::flatten(Function *f) {
   new StoreInst(switchVar, switchVarAddr, insert);
 
   // Create main loop
-  loopEntry = BasicBlock::Create(f->getContext(), "loopEntry", f, insert);
-  loopEnd = BasicBlock::Create(f->getContext(), "loopEnd", f, insert);
+  loopEntry = BasicBlock::Create(f->getContext(), "", f, insert);
+  loopEnd = BasicBlock::Create(f->getContext(), "", f, insert);
 
-  load = new LoadInst(switchVar->getAllocatedType(), switchVar, "switchVar",
+  load = new LoadInst(switchVar->getAllocatedType(), switchVar, "",
                       loopEntry);
 
   // Move first BB on top
@@ -134,7 +136,7 @@ void Flattening::flatten(Function *f) {
   BranchInst::Create(loopEntry, loopEnd);
 
   BasicBlock *swDefault =
-      BasicBlock::Create(f->getContext(), "switchDefault", f, loopEnd);
+      BasicBlock::Create(f->getContext(), "", f, loopEnd);
   BranchInst::Create(loopEnd, swDefault);
 
   // Create switch instruction itself and set condition

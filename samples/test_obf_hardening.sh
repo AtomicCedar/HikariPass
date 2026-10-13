@@ -202,5 +202,103 @@ sys.exit(0 if len(set(seeds)) >= 2 else 1)
 PEOF
 check "T12-dual-stream-seed-kdf" $?
 
+# T13: bcf opaque-predicate strength. Upstream Hikari uses two GLOBAL
+# variables (x, y) for the opaque predicate (y<10 || x*(x+1)%2==0), which
+# is a single-regex signature (the comment even admits it). After the
+# hardening, no bcf-specific global variable may be emitted and the
+# predicate must be computed from locally-derived values.
+cat > "$OUT/bcf_probe.c" <<'BEOF'
+__attribute__((annotate("bcf")))
+int probe(int x) {
+  if (x > 3) x += 2; else x -= 1;
+  return x * 5;
+}
+int main(void) { return probe(4) - 30; }
+BEOF
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/bcf_probe.c" -o "$OUT/bcf_probe.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-bcfobf)' "$OUT/bcf_probe.ll" \
+  -o "$OUT/bcf_probe.bc" 2>"$OUT/bcf.err"
+llvm-dis "$OUT/bcf_probe.bc" -o "$OUT/bcf_o.ll"
+r=0
+if grep -qE '@(HikariBCF|x_bcf|y_bcf|bcfCond)[A-Za-z0-9_]* *=|@.*OpaquePredicate.* =' "$OUT/bcf_o.ll"; then r=1; fi
+llc -filetype=obj "$OUT/bcf_probe.bc" -o "$OUT/bcf_probe.o" 2>/dev/null && \
+clang -no-pie "$OUT/bcf_probe.o" -o "$OUT/bcf_probe_run" 2>/dev/null && \
+"$OUT/bcf_probe_run" >/dev/null 2>&1 || r=1
+check "T13-bcf-local-opaque-predicate" $r
+
+# T14: cff (flattening) must not leak the textbook switchVar signature:
+# a named "%switchVar" alloca + central switch is what deflattener
+# scripts (deflat/astatine) key on. After hardening the state variable
+# must be anonymous (no textual name) and the dispatch must not be a
+# single central switch on a plain counter (checked by absence of the
+# literal "switchVar" name AND presence of mixed dispatch).
+cat > "$OUT/cff_probe.c" <<'CEOF2'
+__attribute__((annotate("cff")))
+int probe(int x) {
+  int r = 0;
+  for (int i = 0; i < 4; ++i) { r += x * i + 1; if (r > 40) r -= 7; }
+  return r;
+}
+int main(void) { return probe(3) != 22; }
+CEOF2
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/cff_probe.c" -o "$OUT/cff_probe.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-cffobf)' "$OUT/cff_probe.ll" \
+  -o "$OUT/cff_probe.bc" 2>/dev/null
+llvm-dis "$OUT/cff_probe.bc" -o "$OUT/cff_o.ll"
+r=0
+if grep -q '"switchVar"\| %switchVar' "$OUT/cff_o.ll"; then r=1; fi
+llc -filetype=obj "$OUT/cff_probe.bc" -o "$OUT/cff_probe.o" 2>/dev/null && \
+clang -no-pie "$OUT/cff_probe.o" -o "$OUT/cff_probe_run" 2>/dev/null && \
+"$OUT/cff_probe_run" >/dev/null 2>&1 || r=1
+check "T14-cff-no-switchvar-signature" $r
+
+# T15: strcry strength. Per-character INDEPENDENT xor with a fresh key is
+# trivially broken by a known-plaintext byte (each byte independent).
+# After hardening the per-element decrypt must mix the key with a rolling
+# state (shift/xor chain), observable in the runtime decrypt helper.
+cat > "$OUT/str_probe.c" <<'SEOF'
+const char *msg = "rolling key probe string";
+int main(void) { return msg[0] != 'r'; }
+SEOF
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/str_probe.c" -o "$OUT/str_probe.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-strcry)' "$OUT/str_probe.ll" \
+  -o "$OUT/str_probe.bc" 2>/dev/null
+llvm-dis "$OUT/str_probe.bc" -o "$OUT/str_o.ll"
+python3 - "$OUT/str_o.ll" <<'PEOF'
+import re, sys
+ll = open(sys.argv[1]).read()
+# locate decryption loops: functions or inlined regions that xor a loaded
+# byte and must also update a rolling key via shift/rotate.
+xs = len(re.findall(r'\bxor\b', ll))
+sh = len(re.findall(r'\b(shl|lshr)\b', ll))
+sys.exit(0 if (xs >= 1 and sh >= 1) else 1)
+PEOF
+check "T15-strcry-rolling-key" $?
+
+# T16: indibran table must not be a .rodata-resident constant: a static
+# constant BlockAddress array lets a static analyzer read every branch
+# target straight out of .rodata. After hardening the table must be
+# non-constant (writable, runtime-initialized) or eliminated.
+cat > "$OUT/ib_probe.c" <<'IEOF'
+__attribute__((annotate("indibranch")))
+int probe(int x) {
+  switch (x) {
+    case 1: return 10; case 2: return 20; case 3: return 30;
+    default: return 40;
+  }
+}
+int main(void) { return probe(2) - 20; }
+IEOF
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/ib_probe.c" -o "$OUT/ib_probe.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-indibran)' "$OUT/ib_probe.ll" \
+  -o "$OUT/ib_probe.bc" 2>/dev/null
+llvm-dis "$OUT/ib_probe.bc" -o "$OUT/ib_o.ll"
+r=0
+if grep -q '@IndirectBranchingGlobalTable = .*constant' "$OUT/ib_o.ll"; then r=1; fi
+llc -filetype=obj "$OUT/ib_probe.bc" -o "$OUT/ib_probe.o" 2>/dev/null && \
+clang -no-pie "$OUT/ib_probe.o" -o "$OUT/ib_probe_run" 2>/dev/null && \
+"$OUT/ib_probe_run" >/dev/null 2>&1 || r=1
+check "T16-indibran-nonconstant-table" $r
+
 rm -rf "$OUT"
 exit $FAIL

@@ -38,6 +38,19 @@ struct IndirectBranch : public FunctionPass {
   std::unordered_map<BasicBlock *, unsigned long long> indexmap;
   std::unordered_map<Function *, ConstantInt *> encmap;
   std::unordered_set<Function *> to_obf_funcs;
+  // hardening: table GV is anonymous now (named "IndirectBranchingGlobalTable"
+  // is a scan signature); keep the pointer instead of a name lookup.
+  GlobalVariable *GlobalTable = nullptr;
+  // hardening: compiler.used requires named GVs, so give them opaque
+  // per-module random names instead of fixed signatures like
+  // "HikariConditionalLocalIndirectBranchingTable".
+  std::string obfGVName(const char *Prefix) {
+    static uint32_t ctr = 0;
+    uint32_t r = cryptoutils->get_uint32_t() ^ (ctr++ * 2654435761u);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%.6s%08x", Prefix, r);
+    return std::string(buf);
+  }
   IndirectBranch() : FunctionPass(ID) {
     this->flag = true;
     this->initialized = false;
@@ -94,8 +107,8 @@ struct IndirectBranch : public FunctionPass {
           ConstantArray::get(AT, ArrayRef<Constant *>(BBs));
       GlobalVariable *Table = new GlobalVariable(
           M, AT, false, GlobalValue::LinkageTypes::PrivateLinkage,
-          BlockAddressArray, "IndirectBranchingGlobalTable");
-      appendToCompilerUsed(M, {Table});
+          BlockAddressArray, "");
+      GlobalTable = Table;
     }
     delete Lower;
     this->initialized = true;
@@ -155,10 +168,10 @@ struct IndirectBranch : public FunctionPass {
             ConstantArray::get(AT, ArrayRef<Constant *>(BlockAddresses));
         LoadFrom = new GlobalVariable(
             *M, AT, false, GlobalValue::LinkageTypes::PrivateLinkage,
-            BlockAddressArray, "HikariConditionalLocalIndirectBranchingTable");
+            BlockAddressArray, obfGVName("ibT").c_str());
         appendToCompilerUsed(*Func.getParent(), {LoadFrom});
       } else {
-        LoadFrom = M->getGlobalVariable("IndirectBranchingGlobalTable", true);
+        LoadFrom = GlobalTable;
       }
       AllocaInst *LoadFromAI = nullptr;
       if (UseStackTemp) {
@@ -189,7 +202,7 @@ struct IndirectBranch : public FunctionPass {
               ConstantInt::get(IndexEncKey->getType(),
                                IndexEncKey->getValue() ^
                                    indexmap[BI->getSuccessor(0)]),
-              "IndirectBranchingIndex");
+              obfGVName("ibI").c_str());
           appendToCompilerUsed(*M, {indexgv});
           indexval = (UseStackTemp ? IRBEntry : IRBBI)
                          ->CreateLoad(indexgv->getValueType(), indexgv);
@@ -234,7 +247,7 @@ struct IndirectBranch : public FunctionPass {
             *M, Int32Ty, false, GlobalValue::LinkageTypes::PrivateLinkage,
             ConstantInt::get(Int32Ty,
                              encenckey->getValue() ^ encmap[&Func]->getValue()),
-            "IndirectBranchingAddressEncryptKey");
+            obfGVName("ibK").c_str());
         appendToCompilerUsed(*M, enckeyGV);
         enckeyLoad = IRBBI->CreateXor(
             IRBBI->CreateLoad(enckeyGV->getValueType(), enckeyGV), encenckey);

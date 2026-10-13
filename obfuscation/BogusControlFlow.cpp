@@ -754,10 +754,10 @@ struct BogusControlFlow : public FunctionPass {
           ConstantInt::get(I32Ty, cryptoutils->get_range(1, UINT32_MAX));
       GlobalVariable *LHSGV =
           new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                             GlobalValue::PrivateLinkage, LHSC, "LHSGV");
+                             GlobalValue::PrivateLinkage, LHSC, "");
       GlobalVariable *RHSGV =
           new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                             GlobalValue::PrivateLinkage, RHSC, "RHSGV");
+                             GlobalValue::PrivateLinkage, RHSC, "");
       LoadInst *LHS =
           (CreateFunctionForOpaquePredicateTemp ? IRBOp : IRBReal)
               ->CreateLoad(LHSGV->getValueType(), LHSGV, "Initial LHS");
