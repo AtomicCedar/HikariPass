@@ -568,8 +568,14 @@ struct StringEncryption : public ModulePass {
           // CIPHER-FEEDBACK advance: s = rol8(s ^ E_loaded) + K. E_loaded is
           // the runtime ciphertext byte (LI), so the chain is real IR.
           Value *XoredState = IRB.CreateXor(RollV, LI);
+          // NOTE: no nuw/nsw here — i8 << 3 overflows for most inputs and
+          // wrapping is REQUIRED (the emitter's rol8 wraps).  With nuw the
+          // overflowing shl is poison and, because D = E ^ (K ^ RollV) now
+          // consumes the state, poison propagates into the decrypted bytes
+          // (upstream's independent-xor path never read RollV, so it got
+          // away with these flags).
           RollV = IRB.CreateAdd(
-              IRB.CreateOr(IRB.CreateShl(XoredState, 3, "", true, true),
+              IRB.CreateOr(IRB.CreateShl(XoredState, 3),
                            IRB.CreateLShr(XoredState, 5)),
               KeyV);
           XORed = IRB.CreateXor(LI, Mix);
