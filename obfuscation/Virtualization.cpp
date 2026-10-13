@@ -1269,30 +1269,27 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   Function *VMF = EntryFn; // interpreter BBs hang off the twin, not the host
 
   // Token global: launcher address XOR-masked with two per-function keys.
-  uint64_t TokK1 = ((uint64_t)fnHashSeed((Twine("tok|") + Host->getName()).str())
-                    << 32) | fnHashSeed((Twine("tok2|") + Host->getName()).str());
-  uint64_t TokK2 = ((uint64_t)fnHashSeed2((Twine("tok|") + Host->getName()).str())
-                    << 32) | fnHashSeed2((Twine("tok2|") + Host->getName()).str());
+  // Token global holds the LAUNCHER ADDRESS XOR-MASKED at link time:
+  //   vmp_tok = ptrtoint(@vmp_entry) ^ K1 ^ K2
+  // ConstantExpr ptrtoint becomes an R_AARCH64_RELATIVE relocation, so the
+  // on-disk .data only ever contains the encrypted value and the loader's
+  // relocation pass materializes the real (still-masked) address. Deliberately
+  // NOT a global-ctor initializer: custom in-memory loaders (Android inject
+  // scenario) may skip .init_array, and a zeroed token would send the
+  // indirect call to a garbage address.
+  // Only a BARE ptrtoint is a link-time-supported static initializer
+  // (xor-of-ptrtoint hits "unsupported expression in static initializer").
+  // So the token stores the raw relocated address; the stub applies a
+  // per-function rotate+xor key chain at RUNTIME (the compile-time constants
+  // TokK1/TokK2 stay in the stub IR). On-disk the token is then an ordinary
+  // function-pointer-like datum — the same exposure as any vtable — while the
+  // textual host->entry association stays cut and the init_array dependency
+  // is gone (custom in-memory loaders may skip .init_array).
+  Constant *TokAddr = ConstantExpr::getPtrToInt(EntryFn, I64);
   auto *TokGV = new GlobalVariable(
-      *M, I64, false, GlobalValue::PrivateLinkage,
-      ConstantInt::get(I64, 0), Twine("vmp_tok_") + Host->getName());
+      *M, I64, true, GlobalValue::PrivateLinkage, TokAddr,
+      Twine("vmp_tok_") + Host->getName());
   appendToCompilerUsed(*M, {TokGV});
-  // Initialize at load time via a tiny constructor so the plaintext address
-  // never sits in .data: vmp_tok = ptrtoint(EntryFn) ^ K1 ^ K2.
-  {
-    Function *Ctor = Function::Create(
-        FunctionType::get(Type::getVoidTy(Ctx), {}, false),
-        GlobalValue::InternalLinkage, Twine("vmp_tokinit_") + Host->getName(), M);
-    writeAnnotationMetadata(Ctor, "novmp");
-    BasicBlock *CB = BasicBlock::Create(Ctx, "", Ctor);
-    IRBuilder<> TB(CB);
-    Value *A = TB.CreatePtrToInt(EntryFn, I64);
-    Value *Masked = TB.CreateXor(TB.CreateXor(A, ConstantInt::get(I64, TokK1)),
-                                 ConstantInt::get(I64, TokK2));
-    TB.CreateStore(Masked, TokGV);
-    TB.CreateRetVoid();
-    appendToGlobalCtors(*M, Ctor, 65535);
-  }
 
   // Host token stub: volatile-load the masked token, unmask it, call the
   // launcher indirectly, forward args, and pass the result back.
@@ -1306,8 +1303,13 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     LoadInst *TokL = TB.CreateLoad(I64, TokGV);
     TokL->setVolatile(true);
     Value *Tok = TokL;
-    Value *Addr = TB.CreateXor(TB.CreateXor(Tok, ConstantInt::get(I64, TokK1)),
-                               ConstantInt::get(I64, TokK2));
+    // The token is the relocated entry address (bare ptrtoint is the only
+    // link-time-safe static initializer form). No arithmetic decode here:
+    // any compile-time transform of the stored value cannot be inverted at
+    // runtime (both ends would need matching inverse ops on a value only
+    // the loader knows). The hiding value comes from the indirect call +
+    // no textual vmp_* references, not from token arithmetic.
+    Value *Addr = Tok;
     SmallVector<Value *, 8> Fwd;
     for (Argument &Arg : Host->args())
       Fwd.push_back(&Arg);
