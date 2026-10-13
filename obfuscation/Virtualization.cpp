@@ -1880,6 +1880,17 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     AllocaInst *RA = entryAlloca64();
     SwitchInst *BS = B.CreateSwitch(Sub, Def, 13);
 
+    // Shadow implementations (hardening): for the associative/commutative-
+    // friendly integer ops, pick a semantically-equivalent but structurally
+    // different evaluation form per function (seeded, so HIKARI_SEED
+    // reproducibility is preserved). An attacker who reverses one handler
+    // pattern cannot assume the same pattern in another binary.
+    // All identities hold over the two's-complement i64 masked domain the
+    // handlers already use (result is re-masked by maskToSize below).
+    uint32_t SH = fnHashSeed((Twine("shadow|") + Host->getName()).str());
+    if (!SH) SH = 0x51ED270B;
+    auto pick = [&]() -> unsigned { return fnNext(&SH); };
+
     auto add = [&](uint8_t CodeV, auto Fn, Value *L, Value *R) {
       auto *BB = BasicBlock::Create(Ctx, "", VMF);
       BS->addCase(cast<ConstantInt>(ConstantInt::get(I8, CodeV)), BB);
@@ -1887,8 +1898,35 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
       CB.CreateStore(Fn(CB, L, R), RA);
       CB.CreateBr(Join);
     };
-    add(BIN_ADD, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateAdd(L, R); }, LHSU, RHSU);
-    add(BIN_SUB, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateSub(L, R); }, LHSU, RHSU);
+    // ADD: v0 = L+R;  v1 = L - (0-R);  v2 = (L|R) + (L&R)
+    {
+      unsigned V = pick() % 3;
+      switch (V) {
+      case 1:
+        add(BIN_ADD, [](IRBuilder<> &B, Value *L, Value *R) {
+          return B.CreateSub(L, B.CreateSub(ConstantInt::get(L->getType(), 0), R));
+        }, LHSU, RHSU);
+        break;
+      case 2:
+        add(BIN_ADD, [](IRBuilder<> &B, Value *L, Value *R) {
+          return B.CreateAdd(B.CreateOr(L, R), B.CreateAnd(L, R));
+        }, LHSU, RHSU);
+        break;
+      default:
+        add(BIN_ADD, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateAdd(L, R); }, LHSU, RHSU);
+      }
+    }
+    // SUB: v0 = L-R;  v1 = L + (~R) + 1
+    {
+      unsigned V = pick() % 2;
+      if (V == 1)
+        add(BIN_SUB, [](IRBuilder<> &B, Value *L, Value *R) {
+          return B.CreateAdd(B.CreateAdd(L, B.CreateNot(R)),
+                             ConstantInt::get(L->getType(), 1));
+        }, LHSU, RHSU);
+      else
+        add(BIN_SUB, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateSub(L, R); }, LHSU, RHSU);
+    }
     add(BIN_MUL, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateMul(L, R); }, LHSU, RHSU);
     add(BIN_UDIV, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateUDiv(L, R); }, LHSU, RHSU);
     add(BIN_SDIV, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateSDiv(L, R); }, LHSS, RHSS);
@@ -1897,9 +1935,37 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     add(BIN_SHL, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateShl(L, R); }, LHSU, RHSU);
     add(BIN_LSHR, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateLShr(L, R); }, LHSU, RHSU);
     add(BIN_ASHR, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateAShr(L, R); }, LHSS, RHSS);
-    add(BIN_AND, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateAnd(L, R); }, LHSU, RHSU);
-    add(BIN_OR, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateOr(L, R); }, LHSU, RHSU);
-    add(BIN_XOR, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateXor(L, R); }, LHSU, RHSU);
+    // AND: v0 = L&R;  v1 = ~(~L|~R)
+    {
+      unsigned V = pick() % 2;
+      if (V == 1)
+        add(BIN_AND, [](IRBuilder<> &B, Value *L, Value *R) {
+          return B.CreateNot(B.CreateOr(B.CreateNot(L), B.CreateNot(R)));
+        }, LHSU, RHSU);
+      else
+        add(BIN_AND, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateAnd(L, R); }, LHSU, RHSU);
+    }
+    // OR: v0 = L|R;  v1 = ~(~L&~R)
+    {
+      unsigned V = pick() % 2;
+      if (V == 1)
+        add(BIN_OR, [](IRBuilder<> &B, Value *L, Value *R) {
+          return B.CreateNot(B.CreateAnd(B.CreateNot(L), B.CreateNot(R)));
+        }, LHSU, RHSU);
+      else
+        add(BIN_OR, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateOr(L, R); }, LHSU, RHSU);
+    }
+    // XOR: v0 = L^R;  v1 = (L|R) & ~(L&R)
+    {
+      unsigned V = pick() % 2;
+      if (V == 1)
+        add(BIN_XOR, [](IRBuilder<> &B, Value *L, Value *R) {
+          return B.CreateAnd(B.CreateOr(L, R),
+                             B.CreateNot(B.CreateAnd(L, R)));
+        }, LHSU, RHSU);
+      else
+        add(BIN_XOR, [](IRBuilder<> &B, Value *L, Value *R) { return B.CreateXor(L, R); }, LHSU, RHSU);
+    }
 
     IRBuilder<> BD(Def);
     BD.CreateStore(ConstantInt::get(I64, 0), RA);

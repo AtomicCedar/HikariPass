@@ -345,5 +345,43 @@ clang -no-pie "$OUT/tok_probe.o" -o "$OUT/tok_run" 2>/dev/null && \
 "$OUT/tok_run" >/dev/null 2>&1 || r=1
 check "T17-vmp-token-entry" $r
 
+# T18: shadow binop implementations. The BIN_ADD/SUB/AND/OR/XOR handlers
+# must not be fixed textbook patterns (a+b, a-b, a&b...): different
+# HIKARI_SEED must produce semantically-equivalent but structurally
+# different handler bodies, and parity must hold for the shadow forms.
+cat > "$OUT/shadow_probe.c" <<'SEOF2'
+__attribute__((annotate("vmp")))
+int calc(int a, int b) {
+  int x = a + b;
+  int y = x - 3;
+  int z = y & 0xFF;
+  int w = z | 0x10;
+  int q = w ^ 0x55;
+  return q;
+}
+int ref(int a, int b) { int x=a+b, y=x-3, z=y&0xFF, w=z|0x10, q=w^0x55; return q; }
+int main(void) { return calc(10, 20) != ref(10, 20); }
+SEOF2
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/shadow_probe.c" -o "$OUT/shadow_probe.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/shadow_probe.ll" -o "$OUT/sh1.bc" 2>/dev/null
+HIKARI_SEED=777 opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/shadow_probe.ll" -o "$OUT/sh2.bc" 2>/dev/null
+llvm-dis "$OUT/sh1.bc" -o "$OUT/sh1.ll"
+llvm-dis "$OUT/sh2.bc" -o "$OUT/sh2.ll"
+python3 - "$OUT/sh1.ll" "$OUT/sh2.ll" <<'PEOF'
+import re, sys, hashlib
+def handler_sig(path):
+    ll = open(path).read()
+    m = re.search(r'define internal [^@]*@vmp_entry_calc\([^)]*\).*?\n}', ll, re.S)
+    body = m.group(0) if m else ll
+    ops = re.findall(r'\b(add|sub|mul|and|or|xor|shl|lshr|ashr)\b i64', body)
+    return hashlib.sha256(','.join(ops).encode()).hexdigest()
+s1, s2 = handler_sig(sys.argv[1]), handler_sig(sys.argv[2])
+sys.exit(0 if s1 != s2 else 1)
+PEOF
+T18A=$?
+llc -filetype=obj "$OUT/sh1.bc" -o "$OUT/sh1.o" 2>/dev/null && clang -no-pie "$OUT/sh1.o" -o "$OUT/sh1run" 2>/dev/null && "$OUT/sh1run" >/dev/null 2>&1 || T18A=1
+llc -filetype=obj "$OUT/sh2.bc" -o "$OUT/sh2.o" 2>/dev/null && clang -no-pie "$OUT/sh2.o" -o "$OUT/sh2run" 2>/dev/null && "$OUT/sh2run" >/dev/null 2>&1 || T18A=1
+check "T18-shadow-binop-variants" $T18A
+
 rm -rf "$OUT"
 exit $FAIL
