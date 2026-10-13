@@ -300,5 +300,50 @@ clang -no-pie "$OUT/ib_probe.o" -o "$OUT/ib_probe_run" 2>/dev/null && \
 "$OUT/ib_probe_run" >/dev/null 2>&1 || r=1
 check "T16-indibran-nonconstant-table" $r
 
+# T17: VMP token-entry. Previously the host function's body WAS the VM
+# launcher: its entry block directly references vmp_code_<fn>/
+# vmp_seeds_<fn>/vmp_seed_<fn>/vmp_mask_<fn>, so the first basic block of
+# every virtualized function screams "Hikari VM". After hardening the host
+# body must be a token stub: (a) no direct reference to any vmp_* global
+# or call to any vmp_* helper from the HOST function, (b) the launcher
+# lives in a separate internal function vmp_entry_<fn>, (c) the host calls
+# it indirectly through a pointer computed at runtime (indirect call, not
+# a direct @vmp_entry_<fn> reference).
+cat > "$OUT/tok_probe.c" <<'TEOF'
+__attribute__((annotate("vmp")))
+int target(int x) { return x * 7 + 3; }
+int main(void) { return target(5) != 38; }
+TEOF
+clang -O0 -emit-llvm -S -Xclang -disable-O0-optnone "$OUT/tok_probe.c" -o "$OUT/tok_probe.ll"
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/tok_probe.ll" \
+  -o "$OUT/tok_probe.bc" 2>"$OUT/tok.err"
+llvm-dis "$OUT/tok_probe.bc" -o "$OUT/tok_o.ll"
+python3 - "$OUT/tok_o.ll" <<'PEOF'
+import re, sys
+ll = open(sys.argv[1]).read()
+m = re.search(r'define [^@]*@target\([^)]*\)[^\{]*\{([^#]*)', ll)
+host = m.group(1) if m else ''
+if not host:
+    sys.exit(1)
+# (a) host must not directly call vmp_* helpers or reference vmp_* globals
+if re.search(r'call.*@vmp_(seed|mask|eval|read_var|ch)_', host): sys.exit(1)
+if re.search(r'@vmp_(code|seeds)_', host): sys.exit(1)
+sys.exit(0)
+PEOF
+T17A=$?
+# (b) launcher moved into its own internal function
+if grep -q 'define internal.*@vmp_entry_target' "$OUT/tok_o.ll"; then r2=0; else r2=1; fi
+# (c) host must contain an INDIRECT call (callee not spelled @name)
+IND=$(awk '/define.*@target\(/,/^}/' "$OUT/tok_o.ll" | grep -cE 'call [^@]*\(')
+r=0
+[ "$T17A" -ne 0 ] && r=1
+[ "$r2" -ne 0 ] && r=1
+[ "$IND" -eq 0 ] && r=1
+# parity must hold
+llc -filetype=obj "$OUT/tok_probe.bc" -o "$OUT/tok_probe.o" 2>/dev/null && \
+clang -no-pie "$OUT/tok_probe.o" -o "$OUT/tok_run" 2>/dev/null && \
+"$OUT/tok_run" >/dev/null 2>&1 || r=1
+check "T17-vmp-token-entry" $r
+
 rm -rf "$OUT"
 exit $FAIL

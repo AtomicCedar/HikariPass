@@ -29,6 +29,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 
 #include <map>
 #include <optional>
@@ -1253,11 +1254,84 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   Host->setLinkage(Link);
   turnOffOptimization(Host);
 
-  auto *Entry = BasicBlock::Create(Ctx, "", Host);
-  auto *Loop = BasicBlock::Create(Ctx, "", Host);
-  auto *Disp = BasicBlock::Create(Ctx, "", Host);
-  auto *Halt = BasicBlock::Create(Ctx, "", Host);
-  auto *Trap = BasicBlock::Create(Ctx, "", Host);
+  // ---- Token entry (hardening): the host function body used to BE the VM
+  // launcher — its entry block referenced vmp_code_/vmp_seeds_/vmp_seed_ and
+  // any "first BB looks like a VM" signature scan matched instantly. Now the
+  // whole interpreter lives in an internal vmp_entry_<fn> twin and the host
+  // body is a token stub: it decodes the launcher address from an XOR-masked
+  // global and calls it INDIRECTLY. No vmp_* symbol is reachable from the
+  // host's textual body.
+  FunctionType *FTy = Host->getFunctionType();
+  Function *EntryFn = Function::Create(FTy, GlobalValue::InternalLinkage,
+                                       Twine("vmp_entry_") + Host->getName(), M);
+  writeAnnotationMetadata(EntryFn, "novmp");
+  turnOffOptimization(EntryFn);
+  Function *VMF = EntryFn; // interpreter BBs hang off the twin, not the host
+
+  // Token global: launcher address XOR-masked with two per-function keys.
+  uint64_t TokK1 = ((uint64_t)fnHashSeed((Twine("tok|") + Host->getName()).str())
+                    << 32) | fnHashSeed((Twine("tok2|") + Host->getName()).str());
+  uint64_t TokK2 = ((uint64_t)fnHashSeed2((Twine("tok|") + Host->getName()).str())
+                    << 32) | fnHashSeed2((Twine("tok2|") + Host->getName()).str());
+  auto *TokGV = new GlobalVariable(
+      *M, I64, false, GlobalValue::PrivateLinkage,
+      ConstantInt::get(I64, 0), Twine("vmp_tok_") + Host->getName());
+  appendToCompilerUsed(*M, {TokGV});
+  // Initialize at load time via a tiny constructor so the plaintext address
+  // never sits in .data: vmp_tok = ptrtoint(EntryFn) ^ K1 ^ K2.
+  {
+    Function *Ctor = Function::Create(
+        FunctionType::get(Type::getVoidTy(Ctx), {}, false),
+        GlobalValue::InternalLinkage, Twine("vmp_tokinit_") + Host->getName(), M);
+    writeAnnotationMetadata(Ctor, "novmp");
+    BasicBlock *CB = BasicBlock::Create(Ctx, "", Ctor);
+    IRBuilder<> TB(CB);
+    Value *A = TB.CreatePtrToInt(EntryFn, I64);
+    Value *Masked = TB.CreateXor(TB.CreateXor(A, ConstantInt::get(I64, TokK1)),
+                                 ConstantInt::get(I64, TokK2));
+    TB.CreateStore(Masked, TokGV);
+    TB.CreateRetVoid();
+    appendToGlobalCtors(*M, Ctor, 65535);
+  }
+
+  // Host token stub: volatile-load the masked token, unmask it, call the
+  // launcher indirectly, forward args, and pass the result back.
+  {
+    Host->deleteBody();
+    Host->setLinkage(Link);
+    turnOffOptimization(Host);
+    BasicBlock *HB0 = BasicBlock::Create(Ctx, "", Host);
+    IRBuilder<> TB(HB0);
+    FunctionType *PTy = FunctionType::get(I64, {I64}, false);
+    LoadInst *TokL = TB.CreateLoad(I64, TokGV);
+    TokL->setVolatile(true);
+    Value *Tok = TokL;
+    Value *Addr = TB.CreateXor(TB.CreateXor(Tok, ConstantInt::get(I64, TokK1)),
+                               ConstantInt::get(I64, TokK2));
+    SmallVector<Value *, 8> Fwd;
+    for (Argument &Arg : Host->args())
+      Fwd.push_back(&Arg);
+    Value *FP = TB.CreateIntToPtr(Addr, PointerType::get(Ctx, 0));
+    Value *RetV = nullptr;
+    if (Host->getReturnType()->isVoidTy()) {
+      // void: call through a void-function pointer type
+      FunctionType *VFty = FunctionType::get(Type::getVoidTy(Ctx),
+                                             FTy->params(), false);
+      Value *VFP = TB.CreateIntToPtr(Addr,
+          PointerType::get(VFty, 0));
+      TB.CreateCall(VFty, VFP, Fwd);
+      TB.CreateRetVoid();
+    } else {
+      Value *RV = TB.CreateCall(FTy, FP, Fwd);
+      TB.CreateRet(RV);
+    }
+  }
+
+  auto *Entry = BasicBlock::Create(Ctx, "", VMF);
+  auto *Loop = BasicBlock::Create(Ctx, "", VMF);
+  auto *Disp = BasicBlock::Create(Ctx, "", VMF);
+  auto *Halt = BasicBlock::Create(Ctx, "", VMF);
+  auto *Trap = BasicBlock::Create(Ctx, "", VMF);
 
   // Handler scratch allocas MUST live in the entry block.  llc lowers an
   // alloca in a non-entry block to a DYNAMIC stack adjustment that is never
@@ -1275,24 +1349,24 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   auto entryAlloca32 = [&]() { return SzT32; };
   auto entryAlloca64 = [&]() { return SzT64; };
 
-  auto *HAlloca = BasicBlock::Create(Ctx, "", Host);
-  auto *HLoad = BasicBlock::Create(Ctx, "", Host);
-  auto *HStore = BasicBlock::Create(Ctx, "", Host);
-  auto *HBin = BasicBlock::Create(Ctx, "", Host);
-  auto *HIcmp = BasicBlock::Create(Ctx, "", Host);
-  auto *HBr = BasicBlock::Create(Ctx, "", Host);
-  auto *HRet = BasicBlock::Create(Ctx, "", Host);
-  auto *HGep = BasicBlock::Create(Ctx, "", Host);
-  auto *HCall = BasicBlock::Create(Ctx, "", Host);
-  auto *HCast = BasicBlock::Create(Ctx, "", Host);
-  auto *HSel = BasicBlock::Create(Ctx, "", Host);
-  auto *HUnr = BasicBlock::Create(Ctx, "", Host);
-  auto *HRmw = BasicBlock::Create(Ctx, "", Host);
-  auto *HCxg = BasicBlock::Create(Ctx, "", Host);
-  auto *HCopy = BasicBlock::Create(Ctx, "", Host);
-  auto *HFBin = BasicBlock::Create(Ctx, "", Host);
-  auto *HFCmp = BasicBlock::Create(Ctx, "", Host);
-  auto *HFCast = BasicBlock::Create(Ctx, "", Host);
+  auto *HAlloca = BasicBlock::Create(Ctx, "", VMF);
+  auto *HLoad = BasicBlock::Create(Ctx, "", VMF);
+  auto *HStore = BasicBlock::Create(Ctx, "", VMF);
+  auto *HBin = BasicBlock::Create(Ctx, "", VMF);
+  auto *HIcmp = BasicBlock::Create(Ctx, "", VMF);
+  auto *HBr = BasicBlock::Create(Ctx, "", VMF);
+  auto *HRet = BasicBlock::Create(Ctx, "", VMF);
+  auto *HGep = BasicBlock::Create(Ctx, "", VMF);
+  auto *HCall = BasicBlock::Create(Ctx, "", VMF);
+  auto *HCast = BasicBlock::Create(Ctx, "", VMF);
+  auto *HSel = BasicBlock::Create(Ctx, "", VMF);
+  auto *HUnr = BasicBlock::Create(Ctx, "", VMF);
+  auto *HRmw = BasicBlock::Create(Ctx, "", VMF);
+  auto *HCxg = BasicBlock::Create(Ctx, "", VMF);
+  auto *HCopy = BasicBlock::Create(Ctx, "", VMF);
+  auto *HFBin = BasicBlock::Create(Ctx, "", VMF);
+  auto *HFCmp = BasicBlock::Create(Ctx, "", VMF);
+  auto *HFCast = BasicBlock::Create(Ctx, "", VMF);
   (void)0;
 
   // Handler shuffling: physically reorder the handler BBs in the function
@@ -1313,7 +1387,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
       Handlers[J] = Tmp;
     }
     for (BasicBlock *HB : Handlers)
-      HB->moveBefore(Host->end());
+      HB->moveBefore(VMF->end());
   }
 
   // call_handler(data*, func_id)
@@ -1397,17 +1471,23 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   Value *Data = EB.CreateBitCast(DataAlloca, I8Ptr);
   EB.CreateMemSet(Data, ConstantInt::get(I8, 0), DS, Align(1));
 
-  for (Argument &Arg : Host->args()) {
-    uint32_t Off = V.off(&Arg);
-    Value *Slot = EB.CreateGEP(I8, Data, ConstantInt::get(I64, Off));
-    if (Arg.getType()->isPointerTy()) {
-      Value *AsInt = EB.CreatePtrToInt(&Arg, I64);
-      EB.CreateStore(AsInt, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
-    } else if (Arg.getType()->isFloatTy()) {
-      Value *Bits = EB.CreateZExt(EB.CreateBitCast(&Arg, EB.getInt32Ty()), I64);
-      EB.CreateStore(Bits, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
-    } else {
-      EB.CreateStore(&Arg, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
+  // V.off is keyed on the HOST argument objects; iterate both argument lists
+  // in lockstep (same FunctionType) and copy host arg -> VM data slot.
+  {
+    auto HI = Host->arg_begin();
+    for (Argument &Arg : VMF->args()) {
+      Argument &HArg = *HI++;
+      uint32_t Off = V.off(&HArg);
+      Value *Slot = EB.CreateGEP(I8, Data, ConstantInt::get(I64, Off));
+      if (Arg.getType()->isPointerTy()) {
+        Value *AsInt = EB.CreatePtrToInt(&Arg, I64);
+        EB.CreateStore(AsInt, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
+      } else if (Arg.getType()->isFloatTy()) {
+        Value *Bits = EB.CreateZExt(EB.CreateBitCast(&Arg, EB.getInt32Ty()), I64);
+        EB.CreateStore(Bits, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
+      } else {
+        EB.CreateStore(&Arg, EB.CreateBitCast(Slot, PointerType::get(Ctx, 0)));
+      }
     }
   }
 
@@ -1617,8 +1697,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   AllocaInst *OSForFetch = Encrypt ? OpState : nullptr;
   // IP bound check: any way the bytecode or a bug drives ip past the code
   // image must land in Halt instead of reading out of bounds (Android SEGV).
-  auto *IPBad = BasicBlock::Create(Ctx, "", Host);
-  auto *Fetch = BasicBlock::Create(Ctx, "", Host);
+  auto *IPBad = BasicBlock::Create(Ctx, "", VMF);
+  auto *Fetch = BasicBlock::Create(Ctx, "", VMF);
   DB.CreateCondBr(
       DB.CreateICmpULT(
           DB.CreateLoad(I32, IP),
@@ -1634,7 +1714,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   };
   // FENCE: ordering for virtualized atomic ops (acq_rel is a safe
   // conservative upgrade of the acquire/release the producer used).
-  auto *HFence = BasicBlock::Create(Ctx, "", Host);
+  auto *HFence = BasicBlock::Create(Ctx, "", VMF);
   {
     IRBuilder<> B(HFence);
     B.CreateFence(AtomicOrdering::AcquireRelease, SyncScope::System);
@@ -1717,12 +1797,12 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     IRBuilder<> B(HStore);
     // manually read packed val then eval ptr
-    auto *SVar = BasicBlock::Create(Ctx, "", Host);
-    auto *SCst = BasicBlock::Create(Ctx, "", Host);
-    auto *SCLoop = BasicBlock::Create(Ctx, "", Host);
-    auto *SCBody = BasicBlock::Create(Ctx, "", Host);
-    auto *SCDone = BasicBlock::Create(Ctx, "", Host);
-    auto *SJoin = BasicBlock::Create(Ctx, "", Host);
+    auto *SVar = BasicBlock::Create(Ctx, "", VMF);
+    auto *SCst = BasicBlock::Create(Ctx, "", VMF);
+    auto *SCLoop = BasicBlock::Create(Ctx, "", VMF);
+    auto *SCBody = BasicBlock::Create(Ctx, "", VMF);
+    auto *SCDone = BasicBlock::Create(Ctx, "", VMF);
+    auto *SJoin = BasicBlock::Create(Ctx, "", VMF);
 
     Value *Size = getB(B);
     Value *Tid = getB(B);
@@ -1793,13 +1873,13 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     Value *LHSS = sextToI64(B, I8, I64, LHSU, Sz);
     Value *RHSS = sextToI64(B, I8, I64, RHSU, Sz);
 
-    auto *Def = BasicBlock::Create(Ctx, "", Host);
-    auto *Join = BasicBlock::Create(Ctx, "", Host);
+    auto *Def = BasicBlock::Create(Ctx, "", VMF);
+    auto *Join = BasicBlock::Create(Ctx, "", VMF);
     AllocaInst *RA = entryAlloca64();
     SwitchInst *BS = B.CreateSwitch(Sub, Def, 13);
 
     auto add = [&](uint8_t CodeV, auto Fn, Value *L, Value *R) {
-      auto *BB = BasicBlock::Create(Ctx, "", Host);
+      auto *BB = BasicBlock::Create(Ctx, "", VMF);
       BS->addCase(cast<ConstantInt>(ConstantInt::get(I8, CodeV)), BB);
       IRBuilder<> CB(BB);
       CB.CreateStore(Fn(CB, L, R), RA);
@@ -1846,19 +1926,19 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     Value *RHSZ = maskToSize(B, I8, I64, RHS0, RSzV);
     Value *LHSS = sextToI64(B, I8, I64, LHSZ, LSzV);
     Value *RHSS = sextToI64(B, I8, I64, RHSZ, RSzV);
-    auto *Def = BasicBlock::Create(Ctx, "", Host);
-    auto *Join = BasicBlock::Create(Ctx, "", Host);
+    auto *Def = BasicBlock::Create(Ctx, "", VMF);
+    auto *Join = BasicBlock::Create(Ctx, "", VMF);
     AllocaInst *RA = entryAlloca8();
     SwitchInst *IS = B.CreateSwitch(Pred, Def, 10);
     auto addU = [&](uint8_t C, auto Fn) {
-      auto *BB = BasicBlock::Create(Ctx, "", Host);
+      auto *BB = BasicBlock::Create(Ctx, "", VMF);
       IS->addCase(cast<ConstantInt>(ConstantInt::get(I8, C)), BB);
       IRBuilder<> CB(BB);
       CB.CreateStore(CB.CreateZExt(Fn(CB, LHSZ, RHSZ), I8), RA);
       CB.CreateBr(Join);
     };
     auto addS = [&](uint8_t C, auto Fn) {
-      auto *BB = BasicBlock::Create(Ctx, "", Host);
+      auto *BB = BasicBlock::Create(Ctx, "", VMF);
       IS->addCase(cast<ConstantInt>(ConstantInt::get(I8, C)), BB);
       IRBuilder<> CB(BB);
       CB.CreateStore(CB.CreateZExt(Fn(CB, LHSS, RHSS), I8), RA);
@@ -1888,8 +1968,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     IRBuilder<> B(HBr);
     Value *Kind = getB(B);
-    auto *U = BasicBlock::Create(Ctx, "", Host);
-    auto *C = BasicBlock::Create(Ctx, "", Host);
+    auto *U = BasicBlock::Create(Ctx, "", VMF);
+    auto *C = BasicBlock::Create(Ctx, "", VMF);
     B.CreateCondBr(B.CreateICmpEQ(Kind, ConstantInt::get(I8, 0)), U, C);
     IRBuilder<> BU(U);
     Value *TU = BU.CreateTrunc(getU(BU), I32);
@@ -1912,8 +1992,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   {
     IRBuilder<> B(HRet);
     Value *Has = getB(B);
-    auto *RV = BasicBlock::Create(Ctx, "", Host);
-    auto *RN = BasicBlock::Create(Ctx, "", Host);
+    auto *RV = BasicBlock::Create(Ctx, "", VMF);
+    auto *RN = BasicBlock::Create(Ctx, "", VMF);
     B.CreateCondBr(B.CreateICmpNE(Has, ConstantInt::get(I8, 0)), RV, RN);
     IRBuilder<> RVB(RV);
     Value *Val = callEval(RVB);
@@ -1974,9 +2054,9 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     AllocaInst *SrcSzT = entryAlloca8();
     Value *Src = callEval(B, SrcSzT);
     Value *SrcSz = B.CreateLoad(I8, SrcSzT);
-    auto *SextBB = BasicBlock::Create(Ctx, "", Host);
-    auto *NormBB = BasicBlock::Create(Ctx, "", Host);
-    auto *Join = BasicBlock::Create(Ctx, "", Host);
+    auto *SextBB = BasicBlock::Create(Ctx, "", VMF);
+    auto *NormBB = BasicBlock::Create(Ctx, "", VMF);
+    auto *Join = BasicBlock::Create(Ctx, "", VMF);
     AllocaInst *RA = entryAlloca64();
     B.CreateCondBr(B.CreateICmpEQ(Kind, ConstantInt::get(I8, CAST_SEXT)), SextBB,
                    NormBB);
@@ -2036,8 +2116,8 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
         AtomicRMWInst::Nand, AtomicRMWInst::Max,  AtomicRMWInst::Min,
         AtomicRMWInst::UMax, AtomicRMWInst::UMin};
     for (unsigned K = 0; K < 11; ++K)
-      Arms[K] = BasicBlock::Create(Ctx, "", Host);
-    auto *Def = BasicBlock::Create(Ctx, "", Host);
+      Arms[K] = BasicBlock::Create(Ctx, "", VMF);
+    auto *Def = BasicBlock::Create(Ctx, "", VMF);
     SwitchInst *SubSw = B.CreateSwitch(Sub, Def, 11);
     for (unsigned K = 0; K < 11; ++K)
       SubSw->addCase(B.getInt8(K), Arms[K]);
@@ -2109,9 +2189,9 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     Value *Sz = B.CreateLoad(I8, SzT);
     Value *A = callEval(B);
     Value *Bv = callEval(B);
-    BasicBlock *S32 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *S64 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *SDef = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *S32 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *S64 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *SDef = BasicBlock::Create(Ctx, "", VMF);
     {
       auto *SzSw = B.CreateSwitch(B.CreateICmpEQ(Sz, ConstantInt::get(I8, 4)),
                                   S64, 1);
@@ -2181,9 +2261,9 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
       }
       return R;
     };
-    BasicBlock *S32 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *S64 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *SDef2 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *S32 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *S64 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *SDef2 = BasicBlock::Create(Ctx, "", VMF);
     {
       auto *SzSw = B.CreateSwitch(B.CreateICmpEQ(Sz, ConstantInt::get(I8, 4)),
                                   S64, 1);
@@ -2213,21 +2293,21 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
   // kind (select chains over mixed FP widths are invalid IR).
   {
     AllocaInst *SzT = entryAlloca8();
-    BasicBlock *KDef = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KExt = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KTrunc = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KSi = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KFsi = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KFui = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KUi = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KSi32 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KSi64 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KFsi32 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KFsi64 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KFui32 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KFui64 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KUi32 = BasicBlock::Create(Ctx, "", Host);
-    BasicBlock *KUi64 = BasicBlock::Create(Ctx, "", Host);
+    BasicBlock *KDef = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KExt = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KTrunc = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KSi = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KFsi = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KFui = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KUi = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KSi32 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KSi64 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KFsi32 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KFsi64 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KFui32 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KFui64 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KUi32 = BasicBlock::Create(Ctx, "", VMF);
+    BasicBlock *KUi64 = BasicBlock::Create(Ctx, "", VMF);
     IRBuilder<> B(HFCast);
     Value *Kind = getB(B);
     Value *ResOff = callReadVar(B, SzT);
@@ -2357,7 +2437,7 @@ static bool buildInterpreter(Function *Host, VMPContext &V) {
     }
   }
 
-  if (verifyFunction(*Host, &errs()) || verifyFunction(*EvalFn, &errs()) ||
+  if (verifyFunction(*VMF, &errs()) || verifyFunction(*Host, &errs()) || verifyFunction(*EvalFn, &errs()) ||
       verifyFunction(*ReadVarFn, &errs()) ||
       verifyFunction(*CallHandler, &errs()) ||
       verifyFunction(*SeedReloadFn, &errs())) {

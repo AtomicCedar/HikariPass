@@ -36,7 +36,11 @@ with tempfile.TemporaryDirectory() as td:
     if r.returncode: print("opt fail:", r.stderr[-2000:]); sys.exit(2)
     r = run([os.path.join(LLVM, "llvm-dis"), bc, "-o", llc_bc])
     s = open(llc_bc).read()
-    fn = re.search(r"define dso_local i32 @vmp_add\(.*?\n}", s, re.S).group(0)
+    # Token-entry hardening: the interpreter lives in vmp_entry_<fn>
+    mfn = re.search(r"define internal [^@]*@vmp_entry_vmp_add\(.*?\n}", s, re.S)
+    if not mfn:
+        mfn = re.search(r"define dso_local i32 @vmp_add\(.*?\n}", s, re.S)
+    fn = mfn.group(0)
     # find the main opcode switch: switch on an i8 with ~12 cases
     m = None
     targets = []
