@@ -81,12 +81,20 @@ clang secret.o -o secret
 
 ```bash
 ./samples/run_vmp.sh          # 基础正确性（算术/分支/GEP/call/全局/递归）
-bash samples/test_obf_hardening.sh   # 12 项加固验收 gates（T1-T12:
+bash samples/test_obf_hardening.sh   # 18 项加固验收 gates（T1-T18:
   # BB 名/seed 表多态/parity/多线程/varargs 跳过/JNI_OnLoad/handler 洗牌/
-  # 全局指针字符串/原子长循环/浮点虚拟化/双流 KDF）
+  # 全局指针字符串/原子长循环/浮点虚拟化/双流 KDF/bcf 本地谓词/cff 匿名
+  # switchVar/strcry 滚动密钥/indibran 非常量表/token entry/影子 binop）
 # 复杂样例源码：samples/c/vmp_complex.c
 # 复杂样例对比产物：samples/out/vc_vmp、samples/out/vc_vmp_cff
 ```
+
+### 2.5 CI（GitHub Actions）
+
+| Workflow | 内容 |
+|----------|------|
+| `.github/workflows/gates.yml`（`hardening-gates`） | LLVM 21/23 双矩阵，T1-T18 gates + `run_vmp.sh` 冒烟；push/PR 自动触发 |
+| `.github/workflows/ci.yml`（上游） | LLVM 22 构建插件 + smoke test（含 16-seed 输出复现 sweep）+ 9×15×3 差分 stress + .deb 打包 |
 
 ---
 
@@ -180,10 +188,19 @@ bash samples/test_obf_hardening.sh   # 12 项加固验收 gates（T1-T12:
 | `@vmp_code_<fn>` | 字节码 |
 | `@vmp_seeds_<fn>` | BB seed 表 |
 | `@vmp_seed_<fn>` | 按 IP 重载双 seed |
+| `@vmp_entry_<fn>` | **解释器本体**（internal，函数类型与 host 相同；token entry 架构） |
+| `@vmp_tok_<fn>` | **裸 ptrtoint relocation** 常量（指向 `vmp_entry_<fn>`；任何加载器都可在链接期填对，不依赖 `.init_array`） |
 | `@vmp_eval_<fn>` | 解 `PackedValue` 并求值 |
 | `@vmp_read_var_<fn>` | 读变量操作数（offset） |
 | `@vmp_ch_<fn>` | 出站 call 分发（`call_handler`） |
 | 辅助函数带 `novmp` | 避免被二次 VMP |
+
+**Token entry 架构（T17）**：原函数体被清空为一个小桩 ——
+`volatile load @vmp_tok_<fn>` → `inttoptr` → 间接 call，参数/返回透传。
+全部解释器 BB 挂在 internal 的 `vmp_entry_<fn>` 上。静态反汇编只见一个
+token 加载和一个间接跳转；token 是链接期 relocation（R_*_RELATIVE），
+自写 MemLoader / dlopen 均可正确加载（**禁止**用全局 ctor 初始化 token ——
+自定义内存加载器不跑 `.init_array`，token 会是 0，间接 call 跳野地址）。
 
 ### 4.4 主循环（逻辑）
 
@@ -445,10 +462,22 @@ llvm-dis /tmp/c_obf.bc -o /tmp/c_obf.ll   # 搜 vmp_loop / switchVar
 - 整数 IR 子集虚拟化、出站 call、常见 GEP、全局指针  
 - **标量浮点**（binop/fcmp/fp-cast）与**原子操作**（atomicrmw/cmpxchg/fence）虚拟化  
 - L1 双 seed 加密、SplitMix64+双流 seed 掩码 KDF、逐函数 opcode 多态、
-  handler 洗牌、假 NOP 指令、IP 越界保护、handler 栈泄漏修复  
-- 失败 skip / restore、验收脚本（`test_obf_hardening.sh` 12 项 gates）  
+  handler 洗牌、假 NOP 指令、IP 越界保护、handler 栈泄漏修复
+  （entry 块静态 alloca，**每个用途独立分配** —— 共享单槽会因
+  callEval/callReadVar 生命周期重叠产生数据污染，已被 CI seed sweep 实证）
+- **Token entry 入口**（T17）：host 体只剩 token 桩 + 间接 call，
+  解释器整体藏进 internal `vmp_entry_<fn>`；token 为链接期裸 relocation，
+  自写 MemLoader 兼容（Android 实测）
+- **影子 binop**（T18）：ADD/SUB/AND/OR/XOR handler 各 2-3 种语义等价实现，
+  逐函数按 seed 选型；逆出一个二进制的 handler 模式不能外推
+- 反签名加固（T13-T16）：bcf 谓词全局量匿名、cff switchVar/BB 名匿名、
+  strcry 密文反馈滚动密钥（`s = rol8(s ^ E[i]) + K[i]`，解密端无 nuw/nsw
+  —— i8<<3 溢出 poison 会随滚动状态污染解密字节）、indibran 表随机名+可写
+- 失败 skip / restore、验收脚本（`test_obf_hardening.sh` 18 项 gates）  
 - LLVM 21 与 LLVM 23 双版本构建验证（LLVM 23: DenseMapInfo<CallSite> 哨兵、
   Constant::isZeroValue 移除两处兼容）
+- CI：hardening-gates（LLVM 21/23 矩阵）+ 上游 smoke（16-seed sweep 实证
+  抓出过上述 poison 与 alloca 共享两个真实 bug）
 
 **未做 / 非目标（当前）**
 
@@ -456,6 +485,10 @@ llvm-dis /tmp/c_obf.bc -o /tmp/c_obf.ll   # 搜 vmp_loop / switchVar
 - 商业级 opcode 空间膨胀、多解释器克隆、运行时自修改  
 - Android 自定义 Linker / SO 抽取壳  
 - 按 BB 拆多段小 VM（降低「大块 bytecode」观感的进一步方案）  
+- 字节码逆序（对标 VMPacker；判定性价比低，暂不做）
+- round-to-int intrinsic 虚拟化（`llvm.lrint/lround` 家族在 LLVM 20/21 x86
+  ISel 不支持，需按版本 gate 到 rint/round+fptosi 降级 —— 参考 amice 的做法；
+  Hikari 当前不使用这些 intrinsic，无影响）
 
 ---
 
