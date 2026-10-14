@@ -62,12 +62,24 @@ TV="$("$OUT/thr_obf_bin"; echo "rc=$?")"
 if [[ "$TC" == "$TV" && "$TC" == *"rc=0"* ]]; then r=0; else r=1; fi
 check "T5-multithread-parity" $r
 
-# T6: varargs call sites (JNI style) must not emit verifier-failing IR: the
-# function is skipped cleanly and the module still verifies.
+# T6: varargs handling.  A function BODY that walks va_list (va_start/va_arg
+# intrinsics) must still be skipped cleanly with a verifiable module, while
+# functions that merely CALL varargs functions (printf) must now virtualize
+# and run correctly (call-site ABI preserved through vmp_ch_*).
 clang -O0 -emit-llvm -S "$ROOT/samples/c/vmp_varargs.c" -o "$OUT/va.ll"
 if opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/va.ll" -o "$OUT/va.bc" 2>"$OUT/va.err"; then r=0; else r=1; fi
 if grep -q "verify failed\|does not have terminator\|Terminator found" "$OUT/va.err"; then r=1; fi
-if grep -q "varargs call site" "$OUT/va.err"; then r=0; else r=1; fi
+grep -q "skip sum_varargs" "$OUT/va.err" || r=1
+grep -qE "Running Virtualization On (caller|main)" "$OUT/va.err" || r=1
+if [ "$r" -eq 0 ]; then
+  llc -filetype=obj "$OUT/va.bc" -o "$OUT/va.o" 2>/dev/null && clang -no-pie "$OUT/va.o" -o "$OUT/va_run" 2>/dev/null || r=1
+  clang -O0 "$ROOT/samples/c/vmp_varargs.c" -o "$OUT/va_clean" 2>/dev/null || r=1
+  if [ "$r" -eq 0 ]; then
+    V="$( "$OUT/va_run"; echo "rc=$?" )"
+    W="$( "$OUT/va_clean"; echo "rc=$?" )"
+    [ "$V" == "$W" ] || r=1
+  fi
+fi
 check "T6-varargs-call-site-clean-skip" $r
 
 # T7: a function with NO varargs calls but a global store (JNI_OnLoad shape)
@@ -382,6 +394,32 @@ T18A=$?
 llc -filetype=obj "$OUT/sh1.bc" -o "$OUT/sh1.o" 2>/dev/null && clang -no-pie "$OUT/sh1.o" -o "$OUT/sh1run" 2>/dev/null && "$OUT/sh1run" >/dev/null 2>&1 || T18A=1
 llc -filetype=obj "$OUT/sh2.bc" -o "$OUT/sh2.o" 2>/dev/null && clang -no-pie "$OUT/sh2.o" -o "$OUT/sh2run" 2>/dev/null && "$OUT/sh2run" >/dev/null 2>&1 || T18A=1
 check "T18-shadow-binop-variants" $T18A
+
+# T19: optimized-IR coverage. Real targets are built at -O1/-O2, where the
+# optimizer has rewritten the code into forms the -O0-centric translator
+# historically refused: math intrinsics (llvm.abs/umax/fshl/...), and varargs
+# call sites (printf etc).  The whole function used to be skipped, leaving
+# the hot code unprotected.  At -O2 both functions of vmp_complex.c must now
+# virtualize (no translate-fail lines), and the obfuscated binary must
+# reproduce the clean output bit-for-bit (covers intrinsic lowering AND the
+# varargs call path through vmp_ch_*).
+T19=0
+SRC_COMPLEX="$ROOT/samples/c/vmp_complex.c"
+clang -O2 -emit-llvm -S "$SRC_COMPLEX" -o "$OUT/t19.ll" 2>/dev/null || T19=1
+opt -load-pass-plugin="$PLUGIN" --passes='hikari(enable-vmp)' "$OUT/t19.ll" -o "$OUT/t19.bc" 2> "$OUT/t19.log" || T19=1
+grep -qE "\[VMP\] (translate fail|build fail|\[VMP\] skip)" "$OUT/t19.log" && T19=1
+if [ "$T19" -eq 0 ]; then
+  llc -filetype=obj "$OUT/t19.bc" -o "$OUT/t19.o" 2>/dev/null && \
+    clang -no-pie "$OUT/t19.o" -o "$OUT/t19run" 2>/dev/null || T19=1
+  [ "$T19" -eq 0 ] || true
+  clang -O2 "$SRC_COMPLEX" -o "$OUT/t19clean" 2>/dev/null || T19=1
+  if [ "$T19" -eq 0 ]; then
+    "$OUT/t19run" > "$OUT/t19.out" 2>&1 || T19=1
+    "$OUT/t19clean" > "$OUT/t19want.out" 2>&1 || T19=1
+    cmp -s "$OUT/t19.out" "$OUT/t19want.out" || T19=1
+  fi
+fi
+check "T19-opt-ir-coverage" $T19
 
 rm -rf "$OUT"
 exit $FAIL

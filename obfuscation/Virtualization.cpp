@@ -463,6 +463,82 @@ static bool isIgnorableIntrinsic(const CallBase *CB) {
   }
 }
 
+// Lower integer math intrinsics that -O1/-O2 plants into otherwise
+// virtualizable code into plain binop/icmp/select IR.  Replaces the call and
+// erases it; safe to run repeatedly.  Unhandled intrinsics are left in place
+// and keep the existing "unsupported intrinsic call" refusal.
+static void expandMathIntrinsics(Function &F) {
+  SmallVector<CallInst *, 16> Worklist;
+  for (BasicBlock &BB : F)
+    for (Instruction &I : BB)
+      if (auto *CI = dyn_cast<CallInst>(&I))
+        if (CI->getCalledFunction() && CI->getCalledFunction()->isIntrinsic())
+          Worklist.push_back(CI);
+
+  for (CallInst *CI : Worklist) {
+    Intrinsic::ID ID = CI->getCalledFunction()->getIntrinsicID();
+    IRBuilder<> B(CI);
+    Value *Repl = nullptr;
+    switch (ID) {
+    case Intrinsic::umax:
+    case Intrinsic::smax:
+    case Intrinsic::umin:
+    case Intrinsic::smin: {
+      Value *A = CI->getArgOperand(0), *Vb = CI->getArgOperand(1);
+      CmpInst::Predicate P;
+      switch (ID) {
+      case Intrinsic::umax: P = CmpInst::ICMP_UGT; break;
+      case Intrinsic::smax: P = CmpInst::ICMP_SGT; break;
+      case Intrinsic::umin: P = CmpInst::ICMP_ULT; break;
+      default:              P = CmpInst::ICMP_SLT; break;
+      }
+      Repl = B.CreateSelect(B.CreateICmp(P, A, Vb), A, Vb);
+      break;
+    }
+    case Intrinsic::abs: {
+      // llvm.abs(x, isSigned): unsigned form is umax(x, -x); signed form is
+      // select(x s< 0, sub(0, x), x).  The flag operand may be non-constant
+      // in theory; we only expand the constant case and leave others.
+      Value *X = CI->getArgOperand(0);
+      auto *Flag = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+      if (!Flag)
+        break;
+      if (Flag->isZero())
+        Repl = B.CreateSelect(
+            B.CreateICmpUGT(X, B.CreateNeg(X)), X, B.CreateNeg(X));
+      else
+        Repl = B.CreateSelect(B.CreateICmpSLT(X, ConstantInt::get(X->getType(), 0)),
+                              B.CreateNeg(X), X);
+      break;
+    }
+    case Intrinsic::fshl:
+    case Intrinsic::fshr: {
+      // funnel shift: a:b rotated by (S mod W).  Both shift amounts must be
+      // taken mod W; note (W - S) mod W (NOT W - S) so S == 0 gives shift 0
+      // instead of a full-width (poison) shift.
+      Value *A = CI->getArgOperand(0), *Vb = CI->getArgOperand(1),
+            *Amt = CI->getArgOperand(2);
+      unsigned W = A->getType()->getIntegerBitWidth();
+      Value *SW = ConstantInt::get(Amt->getType(), W);
+      Value *S = B.CreateURem(Amt, SW);
+      Value *Inv = B.CreateURem(B.CreateSub(SW, S), SW);
+      if (ID == Intrinsic::fshl)
+        Repl = B.CreateOr(B.CreateShl(A, S), B.CreateLShr(Vb, Inv));
+      else
+        Repl = B.CreateOr(B.CreateLShr(A, S), B.CreateShl(Vb, Inv));
+      break;
+    }
+    default:
+      break; // ctpop/ctlz/cttz/bswap/etc: not expanded (kept by the existing
+             // "unsupported intrinsic call" refusal until needed)
+    }
+    if (Repl) {
+      CI->replaceAllUsesWith(Repl);
+      CI->eraseFromParent();
+    }
+  }
+}
+
 static bool translateInst(VMPContext &C, Instruction *I) {
   if (auto *AI = dyn_cast<AllocaInst>(I)) {
     if (AI->isArrayAllocation())
@@ -795,12 +871,12 @@ static bool translateInst(VMPContext &C, Instruction *I) {
       return C.fail("invoke"), false;
     if (CB->isMustTailCall())
       return C.fail("musttail"), false;
-    // Varargs call sites (JNI style `env->CallStaticObjectMethod(...)`,
-    // printf, ...) have no fixed callee signature to re-emit from the
-    // interpreter's call handler; translating them produced verifier-failing
-    // IR.  Skip the whole function cleanly instead.
-    if (CB->getFunctionType()->isVarArg())
-      return C.fail("varargs call site"), false;
+    // Varargs call sites (printf, JNI `env->CallStaticObjectMethod(...)`) ARE
+    // supported: the IR call site lists every argument (fixed + variadic) with
+    // its exact type, and CS.FTy keeps the full vararg function type, so
+    // vmp_ch_<fn> re-emits a call that is ABI-identical to the original.
+    // (Historically refused: the re-emitted call produced verifier-failing IR;
+    // that failure mode is gone — T19 exercises printf end-to-end.)
 
     // Only direct calls to known functions, or indirect with mapped callee value.
     CallSiteInfo CS;
@@ -2573,6 +2649,12 @@ static bool virtualizeFunction(Function &F) {
   FixFunctionConstantExpr(&F);
   fixStack(&F);
   FixFunctionConstantExpr(&F);
+
+  // Expand common math intrinsics the optimizer introduced at -O1/-O2 into
+  // plain IR the existing BINOP/ICMP/SELECT handlers already translate.
+  // Done BEFORE the backup clone, so a failed interpreter build restores the
+  // original (intrinsic) form untouched.
+  expandMathIntrinsics(F);
 
   // Backup after preprocess in case interpreter build fails.
   ValueToValueMapTy VMap;

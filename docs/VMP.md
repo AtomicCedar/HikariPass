@@ -81,10 +81,11 @@ clang secret.o -o secret
 
 ```bash
 ./samples/run_vmp.sh          # 基础正确性（算术/分支/GEP/call/全局/递归）
-bash samples/test_obf_hardening.sh   # 18 项加固验收 gates（T1-T18:
-  # BB 名/seed 表多态/parity/多线程/varargs 跳过/JNI_OnLoad/handler 洗牌/
+bash samples/test_obf_hardening.sh   # 19 项加固验收 gates（T1-T19:
+  # BB 名/seed 表多态/parity/多线程/varargs/JNI_OnLoad/handler 洗牌/
   # 全局指针字符串/原子长循环/浮点虚拟化/双流 KDF/bcf 本地谓词/cff 匿名
-  # switchVar/strcry 滚动密钥/indibran 非常量表/token entry/影子 binop）
+  # switchVar/strcry 滚动密钥/indibran 非常量表/token entry/影子 binop/
+  # 优化级 IR 覆盖）
 # 复杂样例源码：samples/c/vmp_complex.c
 # 复杂样例对比产物：samples/out/vc_vmp、samples/out/vc_vmp_cff
 ```
@@ -93,7 +94,7 @@ bash samples/test_obf_hardening.sh   # 18 项加固验收 gates（T1-T18:
 
 | Workflow | 内容 |
 |----------|------|
-| `.github/workflows/gates.yml`（`hardening-gates`） | LLVM 21/23 双矩阵，T1-T18 gates + `run_vmp.sh` 冒烟；push/PR 自动触发 |
+| `.github/workflows/gates.yml`（`hardening-gates`） | LLVM 21/23 双矩阵，T1-T19 gates + `run_vmp.sh` 冒烟；push/PR 自动触发 |
 | `.github/workflows/ci.yml`（上游） | LLVM 22 构建插件 + smoke test（含 16-seed 输出复现 sweep）+ 9×15×3 差分 stress + .deb 打包 |
 
 ---
@@ -333,10 +334,13 @@ FCAST:   op | kind:u8 | res_PV | src_PV             # kind = 6 种转换
 
 日志形如：`[VMP] skip foo (...)` 或 `[VMP] translate fail foo: ...`
 
-- 变参（含 JNI 风格 JNIEnv 方法调用编译出的 varargs call site）  
+- **函数体内使用 `va_start`/`va_arg`**（遍历可变参数自身的函数；仅**调用**
+  varargs 函数如 `printf` 是支持的，调用点 ABI 经 `vmp_ch_*` 完整保留）  
 - 异常 / EH（`invoke`、landingpad 等）  
 - **向量浮点**（vector float；标量浮点已支持）  
 - 复杂多动态索引 GEP  
+- 未展开的数学 intrinsic（`ctpop`/`ctlz`/`cttz`/`bswap` 等；
+  `abs`/`smax`/`smin`/`umax`/`umin`/`fshl`/`fshr` 会自动展开为普通 IR）  
 - 构建解释器失败时会尝试从 backup 恢复函数体  
 
 ### 6.3 建议
