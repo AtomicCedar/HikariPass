@@ -1,42 +1,41 @@
 # CI
 
-Every gate lives in a script, so a human, a local runner and a hosted runner all
-run the same thing — the workflows only decide *where*.
+每个 gate 都封装在脚本里，因此人、本地 runner 和托管 runner 运行的是同一套东西——workflow 只决定*在哪里*运行。
 
-| Gate | Script | What it proves |
+> 注：下表的 smoke 与 stress 脚本仍随仓库分发、可手动运行；但它们**不再属于任何在线 workflow**——原上游 ci.yml 已删除（smoke 覆盖并入 hardening-gates 的 T 系列，stress 因 4 并行 opt 超 7GB runner 内存 OOM 移除）。当前仓库唯一 CI 为 `hardening-gates`（T1-T19 gates + `run_vmp.sh` 冒烟）。
+
+| Gate | 脚本 | 证明什么 |
 |---|---|---|
-| Smoke test | `tools/android-toolchain/smoke-test.sh` | The plugin loads, and obfuscated binaries still print what the clean ones print — host, AArch64, a `-g`/DWARF case, and 16 seeded re-runs |
-| Differential stress | `tools/stress/stress-test.sh` | Sample × pass × seed matrix, every pass on its own, output compared to the clean build |
-| Cross-ABI execution | `tools/stress/cross-run.sh` | The obfuscated Android binaries are *run* under qemu (aarch64, armv7a), not merely compiled |
-| Package verification | `tools/android-toolchain/verify-package.sh` | `dist/*.tar.xz` works unpacked on a machine with no NDK and no system LLVM |
-| Subset sweep | `tools/stress/subset-sweep.sh` | Diagnostic: bisects a pass-interaction bug to the smallest reproducing pass set |
+| Smoke test | `tools/android-toolchain/smoke-test.sh` | 插件能加载，且混淆后的二进制输出与干净二进制一致——覆盖 host、AArch64、一个 `-g`/DWARF 用例，以及 16 个固定种子的重复运行 |
+| Differential stress | `tools/stress/stress-test.sh` | 样本 × pass × 种子矩阵，每个 pass 单独运行，输出与干净构建对比 |
+| Cross-ABI execution | `tools/stress/cross-run.sh` | 混淆后的 Android 二进制在 qemu 下被*实际运行*（aarch64、armv7a），而不仅是编译 |
+| Package verification | `tools/android-toolchain/verify-package.sh` | `dist/*.tar.xz` 在一台既无 NDK 也无系统 LLVM 的机器上解包后可用 |
+| Subset sweep | `tools/stress/subset-sweep.sh` | 诊断工具：将 pass 交互 bug 二分定位到最小的可复现 pass 集合 |
 
-Env they all read: `HIKARI_PLUGIN`, `HIKARI_OPT` (LLVM 22 `opt`), `HIKARI_CC`
-(host clang), `HIKARI_NDK`.
+它们共同读取的环境变量：`HIKARI_PLUGIN`、`HIKARI_OPT`（LLVM 22 的 `opt`）、`HIKARI_CC`
+（host clang）、`HIKARI_NDK`。
 
 ## GitHub
 
-`.github/workflows/ci.yml` runs the full list, including packaging. It is
-currently dormant: GitHub returns `422 Actions has been disabled for this user`
-for the account, which is account-level, not repository-level, and no email or
-notification was sent. Support has to lift it; until then a push produces no run
-and pushes missed during the outage do not run retroactively.
+仓库中唯一的 CI 是 `.github/workflows/gates.yml`（hardening-gates），包含上述全部
+gates。旧的 `.github/workflows/ci.yml`（smoke + stress + .deb 打包）已被删除：
+smoke 覆盖已并入 gates，stress 因 OOM 移除，打包不再属于 CI。
 
 ## Codeberg
 
-`.forgejo/workflows/ci.yml` mirrors the same gates. Two things to set up:
+`.forgejo/workflows/ci.yml` 已删除；Codeberg 侧的 CI 同样以 gates.yml 为准。如需
+在 Codeberg 上运行 Actions，需要两件事：
 
-1. **Enable Actions for the repository.** Repository settings → *Units* → check
-   *Enable Actions*. Nothing runs until this is on.
-2. **Give it a runner.** The `gates` and `release` jobs ask for `self-hosted`
-   (`runs-on: self-hosted`) on purpose — see the limits below. The `lint` job is
-   happy on a Codeberg-hosted runner.
+1. **为仓库启用 Actions。** 仓库设置 → *Units* → 勾选
+   *Enable Actions*。不开启则不会有任何运行。
+2. **提供一个 runner。** `gates` 和 `release` job 有意要求
+   `self-hosted`（`runs-on: self-hosted`）——原因见下方的限制说明。`lint` job
+   在 Codeberg 托管 runner 上即可运行。
 
-### Declaring the toolchain on a self-hosted runner
+### 在 self-hosted runner 上声明工具链
 
-The `gates` and `package` jobs take the toolchain from the runner's environment
-and never install one that is already there. The Forgejo runner reads
-`<runner dir>/.env` at startup, which is where to declare it:
+`gates` 和 `package` job 从 runner 的环境中获取工具链，绝不会重复安装已存在的
+工具链。Forgejo runner 在启动时读取 `<runner dir>/.env`，在这里声明即可：
 
 ```ini
 LLVM_PREFIX=<tree with lib/cmake/llvm>       # what the plugin is built against
@@ -47,21 +46,19 @@ HIKARI_NDK=<ndk>
 HIKARI_STRESS_JOBS=1                         # opt is memory-hungry; 1 on a small box
 ```
 
-`HIKARI_OPT` and `LLVM_PREFIX` are two different trees, and that is normal rather
-than a mistake to paper over: `opt` is the runtime that loads the plugin, while
-`LLVM_PREFIX` is what the plugin is *built* against and needs
-`lib/cmake/llvm/LLVMConfig.cmake`. A tree made by `package-toolchain.sh` has the
-first without the second, and an extracted `llvm-22-dev` has the second without
-the first. The workflow checks each for its own role before it starts, so a wrong
-path fails in seconds instead of after a build.
+`HIKARI_OPT` 和 `LLVM_PREFIX` 是两个不同的目录树，这是正常设计而非需要掩盖的错误：
+`opt` 是加载插件的运行时，而 `LLVM_PREFIX` 是插件*构建时*所针对的目录树，需要包含
+`lib/cmake/llvm/LLVMConfig.cmake`。由 `package-toolchain.sh` 生成的目录树只有前者
+没有后者，而解压出的 `llvm-22-dev` 只有后者没有前者。workflow 会在启动前按各自角色
+逐一校验，因此路径写错会在几秒内失败，而不是等到构建之后。
 
-Nothing machine-specific belongs in the workflow's `env:` block. A workflow-level
-variable overrides what the runner exports, so declaring the toolchain there would
-hide the runner's own and re-download a gigabyte per push.
+任何机器相关的配置都不应写进 workflow 的 `env:` 块。workflow 级变量会覆盖 runner
+导出的值，在那里声明工具链会遮蔽 runner 自身的配置，并导致每次 push 重新下载一个
+GB 的依赖。
 
-### Why the heavy jobs ask for `self-hosted`
+### 为什么重量级 job 要求 `self-hosted`
 
-Codeberg's shared runners cap a job's wall clock and memory:
+Codeberg 共享 runner 对单个 job 的墙钟时间和内存都有上限：
 
 | Label | CPU | RAM | Runtime |
 |---|---|---|---|
@@ -69,31 +66,30 @@ Codeberg's shared runners cap a job's wall clock and memory:
 | `codeberg-small` | 2 | 4 GB | 5 min |
 | `codeberg-medium` | 4 | 8 GB | 10 min |
 
-The RAM quote counts filesystem writes as well. Installing LLVM 22 and building
-the plugin already spends most of a 10-minute budget, before the NDK download,
-the seeded sweep or the qemu matrix start — so pointing those jobs at a shared
-label would mean a workflow that always times out, which is worse than a workflow
-that says so. Register your own runner instead
-(<https://docs.codeberg.org/ci/actions/>) on a machine that already has the
-toolchain; the jobs skip the LLVM/NDK installs when the tools are present.
+RAM 配额还把文件系统写入计算在内。安装 LLVM 22 并构建插件就会耗尽 10 分钟预算的
+大部分，这还没算 NDK 下载、带种子的 sweep 或 qemu 矩阵——因此把这些 job 指向共享
+label 意味着一个总是超时的 workflow，这比一个明确说明限制的 workflow 更糟。应当
+在一台已有工具链的机器上注册自己的 runner
+（<https://docs.codeberg.org/ci/actions/>）；当工具已存在时，这些 job 会跳过
+LLVM/NDK 的安装。
 
-### Pushing, and the release job
+### Push 与 release job
 
 ```bash
 git remote add codeberg https://codeberg.org/<you>/Hikari.git
 git push codeberg master --tags
 ```
 
-Releases need a token with `write:repository`:
+发布 Release 需要一个具有 `write:repository` 权限的 token：
 
-- **Browser:** Codeberg → *Settings* → *Applications* → create a token.
-- **CLI:**
+- **浏览器：** Codeberg → *Settings* → *Applications* → 创建 token。
+- **CLI：**
   ```bash
   fj auth add-token --host https://codeberg.org   # paste the token at the prompt
   ```
-  `fj auth login` (browser flow) also works. `fj` is `forgejo-cli`; the release
-  job uses `fj release create` / `fj release asset create`, so the same token
-  can publish `dist/*.tar.xz` and `libHikari.so` by hand:
+  `fj auth login`（浏览器流程）也可用。`fj` 即 `forgejo-cli`；release job 使用
+  `fj release create` / `fj release asset create`，因此同一 token 也可以手动发布
+  `dist/*.tar.xz` 和 `libHikari.so`：
 
   ```bash
   fj release create v0.1 --tag v0.1 \
@@ -103,4 +99,4 @@ Releases need a token with `write:repository`:
     --host https://codeberg.org --repo <you>/Hikari
   ```
 
-In the workflow the token is the `CODEBERG_TOKEN` repository secret.
+在 workflow 中，token 是 `CODEBERG_TOKEN` 仓库 secret。
