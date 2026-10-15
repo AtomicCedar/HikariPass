@@ -21,6 +21,11 @@ the upstream `ci.yml` (smoke + stress + .deb packaging) was removed after its
 smoke sweep caught two real bugs (both fixed and now covered by the gates), and
 its stress stage kept dying of OOM on the 7GB standard runner.
 
+The tables below describe the packaging layouts that ship in the repo
+(`tools/deb/`, `tools/android-toolchain/`, `tools/termux/`). The GitHub
+Actions release packaging from the old `ci.yml` is gone — build them locally
+with the instructions in those sub-READMEs.
+
 | Target | Artifact | What it is |
 |---|---|---|
 | Ubuntu / Debian x86_64 | `hikari_<version>_amd64.deb` | the plugin, an LLVM 22 `opt` with its `libLLVM`, and `hikari-clang` on `PATH` |
@@ -43,7 +48,7 @@ Packaging details: [`tools/deb/README.md`](tools/deb/README.md) and
 
 | Component | Version |
 |---|---|
-| LLVM this plugin targets | **22** |
+| LLVM this plugin is developed against | **22** (also builds & gates on 21 and 23) |
 | Homebrew `llvm` | 22.1.x (`brew install llvm`) |
 | `rustc` stable | 1.97.x (LLVM 22) |
 | `rustc` nightly | 1.99.x-nightly (LLVM 22) |
@@ -51,11 +56,12 @@ Packaging details: [`tools/deb/README.md`](tools/deb/README.md) and
 **rustc's LLVM major version has to match the LLVM this plugin was built
 against**, or `-Zllvm-plugins` may fail to load it.
 
-The build accepts LLVM **21** as well as 22. 21 is not a target of its own — it
-is there because Termux ships 21.1.8 and nothing newer, and the only way to run
-this on a phone is against the LLVM the phone has. The plugin builds against 21
-and passes `smoke-test.sh` there (14/14, seeded sweep included). Anything older
-is refused at configure time.
+The build accepts LLVM **21, 22 and 23**. 21 is not a target of its own — it
+is there because Termux ships 21.1.8 and nothing newer, and the only way to
+run this on a phone is against the LLVM the phone has. 23 is fully supported
+too (the hardening gates run a 21/23 matrix; LLVM 23 needs two small API
+compat shims that are already in the tree). Anything below 21 is refused at
+configure time.
 
 ## Building
 
