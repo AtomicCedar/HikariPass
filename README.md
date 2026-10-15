@@ -15,10 +15,11 @@ Derived from [Hikari-LLVM15](https://github.com/61bcdefg/Hikari-LLVM15) by 61bcd
 
 Every release carries the plugin and the host that loads it, so nothing has to
 be assembled by hand. See the [releases page](../../releases) for the current
-checksums. Everything on that page is built by the workflow in
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml), and each `.deb` is
-installed and its output compared against a clean build before it is published —
-the arm64 one included, inside an emulated arm64 chroot.
+checksums. Releases are built from the `hardening-gates` workflow
+(`.github/workflows/gates.yml`), which is the repository's only CI workflow —
+the upstream `ci.yml` (smoke + stress + .deb packaging) was removed after its
+smoke sweep caught two real bugs (both fixed and now covered by the gates), and
+its stress stage kept dying of OOM on the 7GB standard runner.
 
 | Target | Artifact | What it is |
 |---|---|---|

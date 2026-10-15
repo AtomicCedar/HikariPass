@@ -94,8 +94,7 @@ bash samples/test_obf_hardening.sh   # 19 项加固验收 gates（T1-T19:
 
 | Workflow | 内容 |
 |----------|------|
-| `.github/workflows/gates.yml`（`hardening-gates`） | LLVM 21/23 双矩阵，T1-T19 gates + `run_vmp.sh` 冒烟；push/PR 自动触发 |
-| `.github/workflows/ci.yml`（上游） | LLVM 22 构建插件 + smoke test（含 16-seed 输出复现 sweep）+ 9×15×3 差分 stress + .deb 打包 |
+| `.github/workflows/gates.yml`（`hardening-gates`） | LLVM 21/23 双矩阵，T1-T19 gates + `run_vmp.sh` 冒烟；push/PR 自动触发。仓库唯一 CI workflow（上游 ci.yml 已删：其 smoke 抓出的两个真 bug 已修复并入 gates；stress 为 OOM 无底洞） |
 
 ---
 
@@ -477,11 +476,12 @@ llvm-dis /tmp/c_obf.bc -o /tmp/c_obf.ll   # 搜 vmp_loop / switchVar
 - 反签名加固（T13-T16）：bcf 谓词全局量匿名、cff switchVar/BB 名匿名、
   strcry 密文反馈滚动密钥（`s = rol8(s ^ E[i]) + K[i]`，解密端无 nuw/nsw
   —— i8<<3 溢出 poison 会随滚动状态污染解密字节）、indibran 表随机名+可写
-- 失败 skip / restore、验收脚本（`test_obf_hardening.sh` 18 项 gates）  
+- 失败 skip / restore、验收脚本（`test_obf_hardening.sh` 19 项 gates）  
 - LLVM 21 与 LLVM 23 双版本构建验证（LLVM 23: DenseMapInfo<CallSite> 哨兵、
   Constant::isZeroValue 移除两处兼容）
-- CI：hardening-gates（LLVM 21/23 矩阵）+ 上游 smoke（16-seed sweep 实证
-  抓出过上述 poison 与 alloca 共享两个真实 bug）
+- CI：hardening-gates（LLVM 21/23 矩阵，仓库唯一 CI；上游 ci.yml 已删——
+  其 16-seed smoke 曾实证抓出上述 poison 与 alloca 共享两个真实 bug，修复
+  后该覆盖已并入 gates；stress 则因 4 并行 opt 超 7GB runner 内存反复被杀）
 
 **未做 / 非目标（当前）**
 
